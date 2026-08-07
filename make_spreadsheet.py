@@ -1,5 +1,8 @@
 """Build the two-sheet relabelling workbook from the flat per-image spreadsheet.
 
+The input is either the original relabelling .xlsx or the dataset builder's dataset.csv;
+farms already covered by a workbook in --exclude-labelled are dropped.
+
 Sheet 1 ("Farm labels"): one row per Farm PFI, with the original label columns and a
 fixed-option confidence dropdown (High/Medium/Low) next to each label.
 
@@ -13,6 +16,7 @@ key columns from the label columns and closing off each farm.
 """
 
 import argparse
+import csv
 from pathlib import Path
 
 import openpyxl
@@ -20,8 +24,12 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
-DEFAULT_INPUT = Path("original_new_2026_07_24_generalisation_relabel_clean.xlsx")
-DEFAULT_OUTPUT = Path("output/2026_07_24_generalisation_relabel_farm_and_image_bega_nowra_freemans.xlsx")
+DEFAULT_INPUT = Path(
+    "/home/mannixe/FLIP/flip-geoimage-dataset-builder/"
+    "original_new_2026_07_24_generalisation/dataset.csv"
+)
+DEFAULT_OUTPUT = Path("output/2026_07_24_generalisation_relabel_farm_and_image_nsw.xlsx")
+DEFAULT_LABELLED = Path("labelled_sheets")
 
 # Columns in the input sheet that describe the farm/image rather than the label.
 KEY_COLUMNS = [
@@ -34,9 +42,51 @@ IMAGE_COLUMN = "image_path"
 COMMENTS_COLUMN = "Comments"
 COUNT_COLUMN = "n_images"
 IMAGE_LABEL_COLUMN = "Label"
+PFI_COLUMN = "Farm PFI"
 
 # Only these reaches are kept; matched case-insensitively against the start of `source`.
-DEFAULT_SOURCES = ["bega", "nowra", "freemans"]
+# The NSW case studies, as opposed to the Victorian ones (bacchusmarsh/balliang/
+# gisborne/wyuna).
+DEFAULT_SOURCES = ["bega", "caniaba", "freemans", "mangrove", "nowra"]
+
+# dataset.csv carries its labels as binary_* one-hots; the workbook instead uses the
+# class list of the earlier relabelling sheets, so the two sets of labels concatenate.
+CSV_LABELS = [
+    "aqua",
+    "commercialpig",
+    "freerangepig",
+    "backyardpig",
+    "sheep",
+    "beef",
+    "dairy",
+    "goat",
+    "horse",
+    "poultry",
+    "residential",
+]
+CSV_COLUMNS = {
+    "source": "source",
+    PFI_COLUMN: "PFI",
+    "source_image_path": "source_image_path",
+    "Farm_type (previous)": "Farm_type",
+    IMAGE_COLUMN: "image_path",
+}
+# Widths taken from the original relabelling workbook; the rest keep Excel's default.
+CSV_WIDTHS = {
+    "source": 24.0,
+    PFI_COLUMN: 34.0,
+    "source_image_path": 55.28,
+    "Farm_type (previous)": 20.0,
+    IMAGE_COLUMN: 122.29,
+    "aqua": 11.0,
+    "commercialpig": 19.57,
+    "freerangepig": 16.86,
+    "backyardpig": 17.71,
+    "sheep": 11.0,
+    "poultry": 12.57,
+    "residential": 14.86,
+    COMMENTS_COLUMN: 34.0,
+}
 
 PRESENT_OPTIONS = ["X"]
 CONFIDENCE_OPTIONS = ["High", "Medium", "Low"]
@@ -84,6 +134,32 @@ def border(left_medium: bool = False, right_medium: bool = False, bottom_medium:
 
 
 def read_source(path: Path) -> tuple[list[str], list[dict], dict[str, float]]:
+    """Read the input into a header list, row dicts, and per-column widths."""
+    if path.suffix.lower() == ".csv":
+        return read_csv(path)
+    return read_workbook(path)
+
+
+def read_csv(path: Path) -> tuple[list[str], list[dict], dict[str, float]]:
+    """Read dataset.csv, renaming its columns onto the relabelling sheet's schema.
+
+    The label columns are left blank: this workbook is what produces those labels.
+    """
+    header = KEY_COLUMNS + [IMAGE_COLUMN] + CSV_LABELS + [COMMENTS_COLUMN]
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = [
+            dict.fromkeys(header) | {name: source_row[column] for name, column in CSV_COLUMNS.items()}
+            for source_row in csv.DictReader(handle)
+        ]
+    for row in rows:
+        pfi = row[PFI_COLUMN]
+        row[PFI_COLUMN] = int(pfi) if str(pfi).isdigit() else pfi
+        # Farms the builder left unlabelled read as an empty cell rather than blank.
+        row["Farm_type (previous)"] = row["Farm_type (previous)"] or "NA"
+    return header, rows, CSV_WIDTHS
+
+
+def read_workbook(path: Path) -> tuple[list[str], list[dict], dict[str, float]]:
     """Read the input sheet into a header list, row dicts, and per-column widths."""
     workbook = openpyxl.load_workbook(path, data_only=True)
     sheet = workbook[workbook.sheetnames[0]]
@@ -109,6 +185,29 @@ def filter_sources(rows: list[dict], sources: list[str]) -> list[dict]:
     """Keep only rows whose `source` shapefile starts with one of the named reaches."""
     wanted = tuple(source.lower() for source in sources)
     return [row for row in rows if str(row["source"]).lower().startswith(wanted)]
+
+
+def labelled_pfis(directory: Path) -> set[str]:
+    """Every Farm PFI appearing in a workbook under `directory`, as strings."""
+    pfis: set[str] = set()
+    for path in sorted(directory.glob("*.xlsx")):
+        if path.name.startswith("~$"):  # Excel's lock files
+            continue
+        workbook = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        for sheet in workbook.worksheets:
+            rows = sheet.iter_rows(values_only=True)
+            header = next(rows, None) or ()
+            if PFI_COLUMN not in header:
+                continue
+            index = header.index(PFI_COLUMN)
+            pfis.update(str(values[index]) for values in rows if values[index] is not None)
+        workbook.close()
+    return pfis
+
+
+def drop_labelled(rows: list[dict], pfis: set[str]) -> list[dict]:
+    """Drop every image of a farm that has already been through a labelling sheet."""
+    return [row for row in rows if str(row[PFI_COLUMN]) not in pfis]
 
 
 def label_columns(header: list[str]) -> list[str]:
@@ -327,6 +426,13 @@ def main() -> None:
         help="reaches to keep, matched against the start of the source shapefile name "
         "(pass with no values to keep everything)",
     )
+    parser.add_argument(
+        "--exclude-labelled",
+        type=Path,
+        default=DEFAULT_LABELLED,
+        help="directory of completed labelling workbooks whose farms are already done "
+        "(pass an empty string to keep everything)",
+    )
     args = parser.parse_args()
 
     header, rows, widths = read_source(args.input)
@@ -334,6 +440,11 @@ def main() -> None:
         rows = filter_sources(rows, args.sources)
         if not rows:
             parser.error(f"no rows match sources {args.sources}")
+    done = labelled_pfis(args.exclude_labelled) if args.exclude_labelled else set()
+    if done:
+        rows = drop_labelled(rows, done)
+        if not rows:
+            parser.error(f"every matching farm is already labelled in {args.exclude_labelled}")
     labels = label_columns(header)
     farms = group_by_farm(rows)
     image_options = labels + EXTRA_IMAGE_OPTIONS
@@ -350,6 +461,7 @@ def main() -> None:
 
     print(f"{args.input} -> {args.output}")
     print(f"  sources: {', '.join(sorted({row['source'] for row in rows}))}")
+    print(f"  excluded: {len(done)} farms already labelled in {args.exclude_labelled}")
     print(f"  {FARM_SHEET}: {len(farms)} farms x {len(labels)} labels (+ confidence)")
     print(f"  {IMAGE_SHEET}: {len(rows)} images, {len(image_options)} dropdown options")
 
