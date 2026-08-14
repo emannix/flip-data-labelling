@@ -79,6 +79,7 @@ to point at a different sweep.
 ## what comes out
 
     output_eval/gen_evaluation.csv        per-class AP, AUC, bootstrap intervals, paired deltas
+    output_eval/gen_evaluation_by_region.csv  the same, per reach: per class and per reach macro
     output_eval/scores_image.csv          one row per labelled crop: annotation + every model score
     output_eval/scores_farm.csv           one row per labelled farm: X marks + aggregated scores
     output_eval/confusion_image.{csv,png} annotated crop label vs model argmax
@@ -104,9 +105,18 @@ spread without re-reading the runs.
   so a class with six positives counts as much as one with a hundred and twenty.
   `aqua` (no positives) and `goat` (no model output) are left blank rather than counted
   as zero.
+- **Over regions.** Nothing is pooled across reaches for the headline numbers — the
+  region breakdown is a separate pass that scores each reach on its own units, against
+  the classes that reach actually contains, so its macro is over a different class set
+  per reach. Compare the two models *within* a reach; comparing reaches to each other
+  confounds difficulty with class mix, which is why each row carries its own prevalence.
 - **Uncertainty.** 95 % percentile intervals from resampling the evaluation units — crops
   or farms — and rescoring the ensemble. The old and new models see the *same* resamples,
-  so the `delta AP` interval is paired.
+  so the `delta AP` interval is paired. A regional macro interval is reported only when
+  at least half the resamples kept every class in that reach; where a reach rests on a
+  class with one or two positives, most draws lose it and the interval is left blank
+  (`[--]` in the terminal, no whisker in the dashboard) rather than quietly re-averaged
+  over whichever classes survived.
 
 ## options
 
@@ -116,6 +126,8 @@ spread without re-reading the runs.
   (default `max`).
 - `--min-confidence {High,Medium,Low}` — drop farm-level X marks the labeller was less
   sure of, turning them into negatives. A sensitivity check, not the headline.
+- `--region-classes` — print every class within every reach, not just each reach's macro.
+  The per-class rows are written to `gen_evaluation_by_region.csv` either way.
 - `--bootstrap` — resamples per interval (default 2000).
 - `--seed` — bootstrap seed (default 0).
 - `--output` — where the CSVs and PNGs land (default `output_eval/`).
@@ -124,3 +136,20 @@ spread without re-reading the runs.
 
 - `--output` — the directory to read the CSVs from (default `output_eval/`).
 - `--file` — where to write the HTML (default `<output>/gen_evaluation_dashboard.html`).
+
+
+# Notes from next
+
+Out of distribution stuff
+
+Can we pull in ALL imagery...
+
+Train model to include Paddock, residential, other/industrial
+
+Then look at inference on a whole region from the generalisation data... What would it look like the government for interpretation?
+PIC data, land use data, FLIP outputs... Do we improve rather than comprimise quality of labels?
+
+
+Train on all the NSW stuff... Test on Victoria...
+Generate data for Balliana - pull everything I haven't already given Hisanthe to label. I'm going to need to move away from PFI's - and go to unique generated identifiers.
+

@@ -41,6 +41,7 @@ HEAT_BREAKS = [0.03, 0.08, 0.16, 0.30, 0.50, 0.75]
 HEAT_FLIP = {"light": 4, "dark": 4}
 
 LEVELS = {"image": "crop", "farm": "farm"}
+MACRO = "MACRO (evaluable)"
 
 
 # --------------------------------------------------------------------------------------
@@ -282,6 +283,150 @@ def pr_panels(scores: pd.DataFrame, truth: dict[str, np.ndarray], level: str) ->
         f'class="tick" text-anchor="middle">precision</text>'
     )
     return svg(width, height, "".join(parts), f"Precision-recall curves, {level} level")
+
+
+def region_chart(regions: pd.DataFrame, level: str) -> str:
+    """Macro AP per reach, both models, with each reach's own prevalence baseline.
+
+    Reaches are ordered by size, and every row carries its unit count - a reach of
+    sixty-odd crops is a different kind of evidence from one of three hundred.
+    """
+    rows = regions[
+        (regions["level"] == level)
+        & (regions["class"] == MACRO)
+        & (regions["seed"] == "ensemble")
+    ]
+    order = (
+        rows.groupby("region")["n_units"].first().sort_values(ascending=False).index.tolist()
+    )
+
+    left, right, top, row_height, gap = 132, 66, 34, 46, 4
+    width = 760
+    height = top + len(order) * row_height + 34
+    plot = width - left - right
+
+    def x_of(value: float) -> float:
+        return left + value * plot
+
+    parts = []
+    for value in np.arange(0, 1.01, 0.25):
+        parts.append(
+            f'<line class="grid" x1="{x_of(value):g}" y1="{top - 12:g}" '
+            f'x2="{x_of(value):g}" y2="{top + len(order) * row_height:g}"/>'
+        )
+        parts.append(text(x_of(value), top - 18, f"{value:.2f}", "tick", "middle"))
+
+    bar = (row_height - 2 * gap - 8) / 2
+    for index, region in enumerate(order):
+        group = rows[rows["region"] == region]
+        y0 = top + index * row_height + gap
+        first = group.iloc[0]
+        parts.append(text(left - 12, y0 + row_height / 2 - 10, region, "rowlabel", "end"))
+        parts.append(
+            text(
+                left - 12,
+                y0 + row_height / 2 + 4,
+                f"{int(first['n_units'])} units, {int(first['n_classes'])} classes",
+                "note",
+                "end",
+            )
+        )
+        for offset, key in enumerate(SERIES):
+            entry = group[group["model"] == key]
+            if entry.empty:
+                continue
+            value = float(entry.iloc[0]["AP"])
+            y = y0 + offset * (bar + 2)
+            parts.append(
+                f'<g class="mark"><path d="{rounded_right(left, y, max(value * plot, 1.5), bar)}" '
+                f'fill="var(--series-{key})"/>'
+                + tip(f"{key}: macro AP {value:.3f} - {region}, {int(first['n_units'])} units")
+                + "</g>"
+            )
+            low, high = entry.iloc[0]["AP_lo"], entry.iloc[0]["AP_hi"]
+            middle = y + bar / 2
+            if pd.notna(low) and pd.notna(high):
+                parts.append(
+                    f'<line class="whisker" x1="{x_of(low):g}" y1="{middle:g}" '
+                    f'x2="{x_of(high):g}" y2="{middle:g}" stroke="var(--series-{key})"/>'
+                )
+            seeded = regions[
+                (regions["level"] == level)
+                & (regions["class"] == MACRO)
+                & (regions["region"] == region)
+                & (regions["model"] == key)
+                & (regions["seed"] != "ensemble")
+            ]
+            for _, run in seeded.iterrows():
+                parts.append(
+                    f'<g class="mark"><circle class="seed" cx="{x_of(run["AP"]):g}" '
+                    f'cy="{middle:g}" r="3.2" stroke="var(--series-{key})"/>'
+                    + tip(f"{key} seed {run['seed']}: macro AP {run['AP']:.3f} - {region}")
+                    + "</g>"
+                )
+        prevalence = float(first["prevalence"])
+        parts.append(
+            f'<line class="baseline-mark" x1="{x_of(prevalence):g}" y1="{y0 - 1:g}" '
+            f'x2="{x_of(prevalence):g}" y2="{y0 + 2 * bar + 3:g}"/>'
+        )
+
+    parts.append(
+        f'<line class="axis" x1="{left:g}" y1="{top + len(order) * row_height:g}" '
+        f'x2="{width - right:g}" y2="{top + len(order) * row_height:g}"/>'
+    )
+    parts.append(text(left + plot / 2, height - 6, "macro average precision", "axistitle", "middle"))
+    return svg(width, height, "".join(parts), f"Macro AP by region, {level} level")
+
+
+def region_class_table(regions: pd.DataFrame, level: str) -> str:
+    """Every class within every reach: AP for both models and the paired difference."""
+    rows = regions[(regions["level"] == level) & (regions["seed"] == "ensemble")]
+    order = (
+        rows.groupby("region")["n_units"].first().sort_values(ascending=False).index.tolist()
+    )
+    head = (
+        "<tr><th>region</th><th>class</th><th>positives</th><th>prevalence</th>"
+        "<th>AP old</th><th>AP new</th><th>&Delta; AP</th></tr>"
+    )
+    body = []
+    for region in order:
+        group = rows[rows["region"] == region]
+        names = [MACRO] + [name for name in group["class"].unique() if name != MACRO]
+        for position, name in enumerate(names):
+            entry = group[group["class"] == name]
+            first = entry.iloc[0]
+            values = {key: entry[entry["model"] == key] for key in SERIES}
+            delta = entry[entry["delta_AP"].notna()]
+            if delta.empty:
+                delta_cell = '<td class="muted">&mdash;</td>'
+            else:
+                value = delta.iloc[0]
+                bounds = (
+                    ""
+                    if pd.isna(value["delta_lo"])
+                    else f' <span class="muted">[{value["delta_lo"]:+.2f}, {value["delta_hi"]:+.2f}]</span>'
+                )
+                delta_cell = f'<td>{value["delta_AP"]:+.3f}{bounds}</td>'
+            label = (
+                f'{escape(region)} <span class="muted">{int(first["n_units"])} units</span>'
+                if position == 0
+                else ""
+            )
+            classes = ' class="total"' if position == 0 else ""
+            body.append(
+                f'<tr{classes}><th scope="row">{label}</th>'
+                f"<td>{escape('macro' if name == MACRO else name)}</td>"
+                f"<td>{int(first['positives'])}</td><td>{first['prevalence']:.3f}</td>"
+                + "".join(
+                    f"<td>{values[key].iloc[0]['AP']:.3f}</td>" if not values[key].empty else "<td>-</td>"
+                    for key in SERIES
+                )
+                + f"{delta_cell}</tr>"
+            )
+    return (
+        f'<div class="scroll"><table class="data region-table"><thead>{head}</thead>'
+        f"<tbody>{''.join(body)}</tbody></table></div>"
+    )
 
 
 def heat_index(fraction: float) -> int:
@@ -593,6 +738,8 @@ table { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size
 .data thead th { color: var(--muted); font-weight: 500; font-size: 11.5px; white-space: nowrap; }
 .data tbody th { text-align: left; font-weight: 500; }
 .data tr.total th, .data tr.total td { font-weight: 650; border-top: 1px solid var(--axis); }
+.region-table tbody th { white-space: nowrap; }
+.region-table tbody td:nth-child(2) { text-align: left; color: var(--ink-2); }
 .muted { color: var(--muted); font-weight: 400; }
 
 .confusions { display: grid; grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); gap: 18px; }
@@ -679,6 +826,8 @@ def build(output: Path) -> str:
         level: pd.read_csv(output / f"confusion_{level}.csv").set_index(["model", "annotated"])
         for level in LEVELS
     }
+    regions = pd.read_csv(output / "gen_evaluation_by_region.csv")
+    reaches = regions["region"].nunique()
 
     ramp = "".join(f'<i style="background:var(--heat-{step})"></i>' for step in range(7))
 
@@ -735,6 +884,32 @@ def build(output: Path) -> str:
 """,
         f"""
 <section>
+  <h2>By region</h2>
+  <p class="lede">The workbooks are labelled one reach at a time, so the reach is the region.
+  Each reach is scored on the classes it actually contains, and its own prevalence baseline is
+  marked on the row &mdash; the class mix differs sharply between reaches, so read the two models
+  against each other <em>within</em> a reach rather than reading one reach against another.
+  A missing whisker means too few bootstrap draws kept every class in that reach.</p>
+  <div class="card">
+    <div class="card-head"><h3>Crop level &mdash; macro AP across {escape(reaches)} reaches</h3>{legend(seeds=True)}</div>
+    <div class="scroll">{region_chart(regions, "image")}</div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Farm level &mdash; macro AP across {escape(reaches)} reaches</h3>{legend(seeds=True)}</div>
+    <div class="scroll">{region_chart(regions, "farm")}</div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Every class within every reach, crop level</h3></div>
+    {region_class_table(regions, "image")}
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Every class within every reach, farm level</h3></div>
+    {region_class_table(regions, "farm")}
+  </div>
+</section>
+""",
+        f"""
+<section>
   <h2>The curves behind the numbers</h2>
   <p class="lede">Precision against recall at every threshold, crop level. The horizontal tick is
   the prevalence: a curve hugging it is no better than picking at random.</p>
@@ -764,6 +939,12 @@ def build(output: Path) -> str:
     <div class="card-head"><h3>Farm level &mdash; each annotated class against the farm's top class</h3>
       <div class="ramp">less{ramp}more of the row</div>
     </div>
+    <p class="lede">Farm labels are multi-label, so a farm carrying two classes appears in both
+    rows, each paired with the same single top class &mdash; the diagonal here means &ldquo;this
+    class is <em>the</em> top class for its farm&rdquo;, which a farm with two classes can satisfy
+    for only one of them. Row totals therefore count annotated (farm, class) pairs, not farms.
+    The top-k agreement above uses the looser rule: a farm counts as a hit when <em>any</em> of
+    its classes is in the top k.</p>
     <div class="confusions">
       {confusion_table(confusion['farm'].loc['old'], models['old'])}
       {confusion_table(confusion['farm'].loc['new'], models['new'])}

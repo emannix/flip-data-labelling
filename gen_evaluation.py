@@ -110,8 +110,21 @@ EXCLUDED_IMAGE_LABELS = {"Ambiguous", "Multiple Classes"}
 
 CONFIDENCE_ORDER = {"High": 3, "Medium": 2, "Low": 1}
 
+# Row label for the unweighted mean over the classes a split can actually score.
+MACRO = "MACRO (evaluable)"
+
 FARM_SHEET = "Farm labels"
 IMAGE_SHEET = "Image labels"
+
+
+def region_name(source: str) -> str:
+    """The reach a row belongs to, read off its shapefile name.
+
+    `Nowra_labels3.shp`, `balliang_labels.shp` -> `Nowra`, `Balliang`. The workbooks are
+    built one reach at a time, so the shapefile is the region.
+    """
+    stem = str(source).split("_labels")[0].removesuffix(".shp")
+    return stem.replace("_", " ").strip().title()
 
 
 # --------------------------------------------------------------------------------------
@@ -327,7 +340,7 @@ def evaluate(
         rows.append(row)
 
     table = pd.DataFrame(rows)
-    macro = {"level": level, "class": "MACRO (evaluable)", "n": n}
+    macro = {"level": level, "class": MACRO, "n": n}
     evaluable = table[table[f"{names[0]} | AP"].notna()]
     macro["positives"] = int(evaluable["positives"].sum())
     macro["prevalence"] = float(evaluable["prevalence"].mean())
@@ -337,6 +350,137 @@ def evaluate(
     if len(names) == 2:
         macro["delta AP (new - old)"] = float(evaluable["delta AP (new - old)"].mean())
     return pd.concat([table, pd.DataFrame([macro])], ignore_index=True)
+
+
+def bootstrap_ap(
+    y_true: np.ndarray, y_score: np.ndarray, resamples: np.ndarray
+) -> np.ndarray:
+    """AP on every resample, NaN where a draw happens to contain no positives."""
+    values = np.full(len(resamples), np.nan)
+    for position, draw in enumerate(resamples):
+        truth = y_true[draw]
+        if truth.any() and not truth.all():
+            values[position] = average_precision_score(truth, y_score[draw])
+    return values
+
+
+# Below this share of usable bootstrap draws the percentile interval is not reported:
+# too much of the resample distribution is missing for the quantiles to mean anything.
+MIN_DRAW_SHARE = 0.5
+
+
+def interval_of(draws: np.ndarray) -> tuple[float, float]:
+    """95 % percentile interval, or NaN when too few draws were usable."""
+    usable = np.isfinite(draws)
+    if usable.mean() < MIN_DRAW_SHARE:
+        return np.nan, np.nan
+    low, high = np.percentile(draws[usable], [2.5, 97.5])
+    return float(low), float(high)
+
+
+def region_summary(
+    level: str,
+    truth: pd.DataFrame,
+    regions: np.ndarray,
+    ensembles: dict[str, np.ndarray],
+    seeds: dict[str, list[np.ndarray]],
+    keys: dict[str, str],
+    reps: int,
+    seed: int,
+) -> pd.DataFrame:
+    """AP per class per reach, and the macro over each reach's scoreable classes.
+
+    Long format: one row per level x region x class x model x seed, with the ensemble
+    row carrying the bootstrap interval and the paired difference. The per-class
+    bootstrap draws are computed once and the macro is derived from them, so the macro
+    interval is consistent with the class intervals underneath it rather than a second,
+    separately resampled quantity.
+
+    Reaches differ in class mix as well as in difficulty, so every row carries the
+    prevalence a random ranker would score: without it the reaches are not comparable to
+    each other, only the models within a reach are.
+    """
+    names = list(ensembles)
+    matrix = truth[CLASSES].to_numpy()
+    rows = []
+
+    for region in sorted(set(regions)):
+        mask = regions == region
+        subset = matrix[mask]
+        n = int(mask.sum())
+        columns = [c for c in range(len(CLASSES)) if 0 < subset[:, c].sum() < n]
+        if not columns:
+            continue
+        resamples = bootstrap_indices(n, reps, seed)
+
+        # Per class: the point AP, the bootstrap draws, and each seed run's own AP.
+        point: dict[tuple[str, str], float] = {}
+        draws: dict[tuple[str, str], np.ndarray] = {}
+        per_seed: dict[tuple[str, str], list[float]] = {}
+        for model in names:
+            scores = ensembles[model][mask]
+            runs = [run[mask] for run in seeds[model]]
+            for column in columns:
+                name = CLASSES[column]
+                y_true = subset[:, column]
+                point[(model, name)] = average_precision_score(y_true, scores[:, column])
+                draws[(model, name)] = bootstrap_ap(y_true, scores[:, column], resamples)
+                per_seed[(model, name)] = [
+                    average_precision_score(y_true, run[:, column]) for run in runs
+                ]
+            # The macro is derived from the class results, not resampled separately, so
+            # its interval stays consistent with the class intervals underneath it.
+            # `mean` rather than `nanmean` on purpose: a draw that loses a rare class's
+            # only positive leaves the macro undefined, and averaging over whatever
+            # classes happen to survive would quietly change the estimand draw to draw
+            # and bias the interval upward. Such draws drop out instead, and
+            # `draws_used` below records how many were left.
+            labels = [CLASSES[column] for column in columns]
+            point[(model, MACRO)] = float(np.mean([point[(model, l)] for l in labels]))
+            draws[(model, MACRO)] = np.mean([draws[(model, l)] for l in labels], axis=0)
+            per_seed[(model, MACRO)] = list(
+                np.mean([per_seed[(model, l)] for l in labels], axis=0)
+            )
+
+        counts = {CLASSES[column]: int(subset[:, column].sum()) for column in columns}
+        counts[MACRO] = int(subset[:, columns].sum())
+        shares = {CLASSES[column]: float(subset[:, column].mean()) for column in columns}
+        shares[MACRO] = float(np.mean(list(shares.values())))
+
+        for name in [CLASSES[column] for column in columns] + [MACRO]:
+            for model in names:
+                common = {
+                    "level": level,
+                    "region": region,
+                    "class": name,
+                    "model": keys[model],
+                    "n_units": n,
+                    "n_classes": len(columns),
+                    "positives": counts[name],
+                    "prevalence": shares[name],
+                }
+                low, high = interval_of(draws[(model, name)])
+                row = {
+                    **common,
+                    "seed": "ensemble",
+                    "AP": point[(model, name)],
+                    "AP_lo": low,
+                    "AP_hi": high,
+                    "draws_used": int(np.isfinite(draws[(model, name)]).sum()),
+                }
+                # The paired difference belongs to the comparison, so it is carried on
+                # the second model's ensemble row rather than duplicated onto both.
+                if len(names) == 2 and model == names[1]:
+                    delta = draws[(names[1], name)] - draws[(names[0], name)]
+                    low, high = interval_of(delta)
+                    row["delta_AP"] = float(np.nanmean(delta)) if np.isfinite(low) else np.nan
+                    row["delta_lo"] = low
+                    row["delta_hi"] = high
+                rows.append(row)
+                for number, value in enumerate(per_seed[(model, name)], start=1):
+                    rows.append({**common, "seed": str(number), "AP": value})
+
+    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------------------
@@ -478,6 +622,60 @@ def score_columns(
     return columns
 
 
+def cell_with_interval(value: float, low: float, high: float, sign: bool = False) -> str:
+    """`0.412 [0.31,0.52]`, dropping the interval when it could not be estimated."""
+    if pd.isna(value):
+        return "-"
+    formatted = f"{value:+.3f}" if sign else f"{value:.3f}"
+    if pd.isna(low) or pd.isna(high):
+        return f"{formatted} [--]"
+    bounds = f"[{low:+.2f},{high:+.2f}]" if sign else f"[{low:.2f},{high:.2f}]"
+    return f"{formatted} {bounds}"
+
+
+def report_regions(regions: pd.DataFrame, keys: list[str], per_class: bool) -> None:
+    """Macro AP per reach, both levels, ensembles only; optionally the classes too."""
+    ensembles = regions[regions["seed"] == "ensemble"]
+    for level in ("image", "farm"):
+        rows = ensembles[ensembles["level"] == level]
+        if rows.empty:
+            continue
+        title = f"By region, {level} level - AP over the classes that reach can score"
+        print(f"\n{title}")
+        print("-" * len(title))
+        header = f"{'region':<18}{'class':<14}{'pos':>5}{'prev':>7}"
+        for key in keys:
+            header += f"{key:>26}"
+        header += f"{'delta AP':>26}"
+        print(header)
+        for region, group in rows.groupby("region", sort=True):
+            wanted = group if per_class else group[group["class"] == MACRO]
+            # The reach's own line leads, with its classes listed underneath it.
+            order = [MACRO] + [name for name in wanted["class"].unique() if name != MACRO]
+            for name in order:
+                entry = wanted[wanted["class"] == name]
+                first = entry.iloc[0]
+                label = f"{region} ({int(first['n_units'])})" if name == MACRO else ""
+                line = (
+                    f"{label:<18}{name:<14}{int(first['positives']):>5}"
+                    f"{first['prevalence']:>7.3f}"
+                )
+                for key in keys:
+                    value = entry[entry["model"] == key].iloc[0]
+                    line += f"{cell_with_interval(value['AP'], value['AP_lo'], value['AP_hi']):>26}"
+                delta = entry[entry["delta_AP"].notna()] if "delta_AP" in entry else entry.iloc[0:0]
+                if delta.empty:
+                    line += f"{'-':>26}"
+                else:
+                    value = delta.iloc[0]
+                    line += f"{cell_with_interval(value['delta_AP'], value['delta_lo'], value['delta_hi'], sign=True):>26}"
+                print(line)
+        print(
+            "The region row counts its units; prev is the class share within that reach. "
+            "A missing interval means too few bootstrap draws kept every class."
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -491,6 +689,12 @@ def main() -> None:
         default=None,
         choices=list(CONFIDENCE_ORDER),
         help="drop farm-level X marks below this labeller confidence",
+    )
+    parser.add_argument(
+        "--region-classes",
+        action="store_true",
+        help="print every class within every reach, not just each reach's macro "
+        "(the per-class rows are written to the CSV either way)",
     )
     parser.add_argument("--bootstrap", type=int, default=2000, help="bootstrap resamples")
     parser.add_argument("--seed", type=int, default=0)
@@ -514,13 +718,13 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
 
     # ---- image level -------------------------------------------------------------
-    truth, rows, label = image_truth(image, dataset)
-    dropped = len(image) - len(truth)
-    print(f"image level: {len(truth)} crops ({dropped} Ambiguous/Multiple Classes dropped)")
+    crop_truth, rows, label = image_truth(image, dataset)
+    dropped = len(image) - len(crop_truth)
+    print(f"image level: {len(crop_truth)} crops ({dropped} Ambiguous/Multiple Classes dropped)")
     image_ensembles = {m: ensembles[m].to_numpy()[rows] for m in models}
     image_seeds = {m: [s.to_numpy()[rows] for s in seeds_by_model[m]] for m in models}
     image_table = evaluate(
-        "image", truth, image_ensembles, image_seeds, args.bootstrap, args.seed
+        "image", crop_truth, image_ensembles, image_seeds, args.bootstrap, args.seed
     )
 
     # ---- farm level --------------------------------------------------------------
@@ -539,6 +743,26 @@ def main() -> None:
     report(image_table, models, "Image level - average precision per class")
     report(farm_table, models, f"Farm level ({args.aggregation} over crops) - average precision")
 
+    # ---- by region ---------------------------------------------------------------
+    keys = {name: spec["key"] for name, spec in MODELS.items()}
+    labelled = image.loc[label.index]
+    crop_regions = labelled["source"].map(region_name).to_numpy()
+    farm_regions = farm["source"].map(region_name).to_numpy()
+    regions = pd.concat(
+        [
+            region_summary(
+                "image", crop_truth, crop_regions, image_ensembles, image_seeds,
+                keys, args.bootstrap, args.seed,
+            ),
+            region_summary(
+                "farm", truth, farm_regions, farm_ensembles, farm_seeds,
+                keys, args.bootstrap, args.seed,
+            ),
+        ],
+        ignore_index=True,
+    )
+    report_regions(regions, list(keys.values()), args.region_classes)
+
     # ---- confusion matrices ------------------------------------------------------
     image_confusions = {m: confusion(label, image_ensembles[m]) for m in models}
     farm_confusions = {m: farm_confusion(truth, farm_ensembles[m]) for m in models}
@@ -556,10 +780,9 @@ def main() -> None:
     # ---- processed CSVs ----------------------------------------------------------
     # The joined scores are the intermediate the dashboard reads, so it never has to
     # touch the run directories or the workbooks again.
-    keys = {name: spec["key"] for name, spec in MODELS.items()}
-    labelled = image.loc[label.index]
     pd.DataFrame(
         {
+            "region": crop_regions,
             "source": labelled["source"].to_numpy(),
             "PFI": labelled["Farm PFI"].astype(float).astype(int).to_numpy(),
             "image_path": labelled["image_path"].to_numpy(),
@@ -570,6 +793,7 @@ def main() -> None:
 
     pd.DataFrame(
         {
+            "region": farm_regions,
             "source": farm["source"].to_numpy(),
             "PFI": pfis,
             "n_images": farm["n_images"].to_numpy(),
@@ -580,6 +804,7 @@ def main() -> None:
 
     out = args.output / "gen_evaluation.csv"
     pd.concat([image_table, farm_table], ignore_index=True).to_csv(out, index=False)
+    regions.to_csv(args.output / "gen_evaluation_by_region.csv", index=False)
     for level, confusions in (("image", image_confusions), ("farm", farm_confusions)):
         frame = pd.concat({keys[m]: c for m, c in confusions.items()}, names=["model", "annotated"])
         frame.to_csv(args.output / f"confusion_{level}.csv")
@@ -597,8 +822,10 @@ def main() -> None:
         ]
     ).to_csv(args.output / "models.csv", index=False)
 
-    print(f"\nwrote {out}, scores_{{image,farm}}.csv, confusion_{{image,farm}}.{{csv,png}}, "
-          f"models.csv in {args.output}")
+    print(
+        f"\nwrote {out}, gen_evaluation_by_region.csv, scores_{{image,farm}}.csv, "
+        f"confusion_{{image,farm}}.{{csv,png}}, models.csv in {args.output}"
+    )
 
 
 if __name__ == "__main__":
