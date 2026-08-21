@@ -34,8 +34,8 @@ DEFAULT_LABELLED = Path("labelled_sheets")
 
 # Columns in the input sheet that describe the farm/image rather than the label.
 KEY_COLUMNS = [
-    "Farm UID",
     "source",
+    "Farm UID",
     "Farm PFI",
     "source_image_path",
     "Farm_type (previous)",
@@ -297,6 +297,10 @@ def set_widths(sheet, widths: list[float | None]) -> None:
 def finish_sheet(sheet, n_columns: int, last_row: int) -> None:
     sheet.freeze_panes = f"{get_column_letter(len(KEY_COLUMNS) + 2)}2"
     sheet.auto_filter.ref = f"A1:{get_column_letter(n_columns)}{last_row}"
+    # The PFI is carried for the join back to the dataset, not for the labeller to read;
+    # the UID identifies the farm on screen, so the column is written but kept hidden.
+    pfi_letter = get_column_letter(KEY_COLUMNS.index(PFI_COLUMN) + 1)
+    sheet.column_dimensions[pfi_letter].hidden = True
 
 
 def add_lists_sheet(workbook, image_options: list[str]):

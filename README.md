@@ -52,6 +52,15 @@ Per reach, e.g.:
         --sources wyuna \
         --output output/2026_07_24_generalisation_relabel_farm_and_image_wyuna.xlsx
 
+Latest pull
+
+    python make_spreadsheet.py \
+        --sources bacchusmarsh \
+        --output output/2026_08_21_generalisation_relabel_farm_and_image_bacchusmarsh.xlsx
+    python make_spreadsheet.py \
+        --sources gisborne \
+        --output output/2026_08_21_generalisation_relabel_farm_and_image_gisborne.xlsx
+
 ## options
 
 - `--input` — `dataset.csv`, or one of the original flat `.xlsx` relabelling sheets.
