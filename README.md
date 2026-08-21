@@ -147,6 +147,111 @@ What they write, and how big each one is:
 - `--exclude-labelled` — directory of completed workbooks whose farms are already done
   (default `labelled_sheets/`). Pass `""` to keep everything.
 
+# building the crop-level dataset
+
+`gen_croplevel_dataset.py` turns the completed workbooks in `labelled_sheets/` back into
+a dataset the models can train on. The builder's `dataset.csv` labels every crop with its
+*farm's* `Farm_type`, which is wrong for most of them — a farm's ten crops are usually
+one shed and nine paddocks — so this reads the per-crop `Label` from each workbook's
+"Image labels" sheet and writes `dataset_relabelled.csv` keyed on that instead.
+
+    python gen_croplevel_dataset.py
+
+Defaults to the same `original_new_2026_08_21_generalisation/dataset.csv` as
+`make_spreadsheet.py`, and writes into that same directory — beside the build's own
+`dataset.csv`, never over it, and with the relative `image_path` values still resolving
+so no imagery is moved or copied. Of the build's 2,913 crops, the 1,705 that have been
+labelled come through less the 76 marked `Ambiguous`, for 1,629. The rest (bacchusmarsh
+and gisborne) are waiting on their workbooks.
+
+The join is on `(farm_uid, ecw_stem, building_cluster)`, not `image_path`: the workbooks
+were written against the PFI-keyed collection, so their paths still read
+`<PFI>/buildings/…` while the current build is keyed on the farm UID.
+
+    dataset_relabelled.csv     all 1,629 crops, with the split column
+    relabelled_train_df.csv      397 crops
+    relabelled_val_df.csv         86 crops
+    relabelled_test_df.csv     1,146 crops
+
+## splits
+
+Geographic, so the held-out set is a different landscape rather than a different farm in
+the same one:
+
+    train/val   NSW   bega, caniaba, freemans, mangrove, nowra      483 crops, 156 farms
+    test        VIC   bacchusmarsh, balliang, gisborne, wyuna     1,146 crops, 242 farms
+
+Every crop is in exactly one of the three — there is no `excluded` split. This is a
+build from scratch, not an increment on a historical one, so there is nothing to stay
+compatible with and no reason to write rows the loaders would have to know to skip.
+
+Within NSW the train/val cut follows `extract_imagery_aerial_csv.py` in the dataset
+builder: grouped on `farm_uid` so a farm's crops never straddle the two, stratified,
+`VAL_FRACTION` (0.20) of the farms, `RANDOM_STATE` 42. The one difference is what it
+stratifies *on* — that script takes the farm's single `processed_class`, but a crop-level
+farm has many crop labels, so the stratum here is the farm's most common non-background
+class (its most common label outright for a farm that is all paddock).
+
+Note how uneven the class split is by region: poultry is 49 crops in NSW against 3 in
+VIC, beef 7 against 49. That is what a geographic hold-out costs, and it is worth
+reading the per-class test numbers with the `crops per split x class` table in hand.
+
+## labels
+
+The workbook dropdown offers the eleven classes plus four catch-alls.
+
+`Paddock` and `Other/Industrial` are kept as classes in their own right — half this
+collection is paddock, and a crop-level classifier has to be able to say so — normalised
+to `paddock` and `other_industrial`.
+
+`Multiple Classes` (17 crops) is not a class but a pointer to the comment, where the
+labeller names what they saw: `Poultry/Freerange pigs`, `Dairy/Horse`, `dairy/ backyard
+pig`. These are **genuinely multi-label** — two real livestock classes in the one crop,
+not something a most-specific rule could collapse — so the crop carries both, and
+`binary_*` says so, exactly as the builder already handles a farm labelled `dairy,beef`.
+Two balliang crops had the label but no comment; both sit on farms X-marked
+`commercialpig` + `freerangepig` on the "Farm labels" sheet, so the farm sheet resolves
+them. The resolved combinations:
+
+    4  dairy,horse            2  backyardpig,dairy         2  poultry,residential
+    4  freerangepig,poultry   2  commercialpig,freerangepig (from the farm sheet)
+    2  horse,poultry          1  backyardpig,commercialpig
+
+Class order within `crop_classes` is canonical, not as written: the same labeller wrote
+both `Dairy/Horse` and `Horse/Dairy` for the same pair, so the comment's order carries no
+information and keeping it would split one combination across two spellings. The raw
+comment is kept in `crop_comments` regardless.
+
+`Ambiguous` (76 crops) means the labeller could not call it at all, so there is nothing
+to train or test on and those are dropped outright. `--drop-labels` with no values keeps
+them.
+
+## columns
+
+Each row carries the class list and both the old and new labels, so nothing is lost:
+
+- `crop_classes` — the crop's classes, comma-separated. The primary column.
+- `n_classes` — 1 for all but the 17 multi-label crops.
+- `processed_class` — first entry of `crop_classes`; what the single-label consumers read.
+- `binary_<class>` — one per class in `CROP_CLASSES`, multi-hot.
+- `farm_processed_class` — what the builder had for the farm, for comparison. The script
+  prints the crosstab against `processed_class`, the quickest read on how much the
+  relabelling changed.
+- `farm_labels` — every class X-marked for that farm on the "Farm labels" sheet.
+- `crop_label` / `crop_comments` / `label_workbook` — the workbook's own words, verbatim.
+
+## options
+
+- `--dataset` — the builder's `dataset.csv` to relabel.
+- `--labelled` — directory of completed workbooks (default `labelled_sheets/`).
+- `--output-dir` — where the csvs land (default: alongside `--dataset`).
+- `--nsw-sources` / `--vic-sources` — the reaches making up each region.
+- `--drop-labels` — workbook labels dropped from the build entirely (default
+  `Ambiguous`). Pass with no values to keep everything.
+- `--val-fraction` — share of the NSW farms promoted to val (default 0.20).
+- `--imagery {symlink,copy,none}` — link or copy the crops under `--output-dir` to make
+  it a standalone dataset (default `none`; only useful with `--output-dir` elsewhere).
+
 # scoring the models
 
 `gen_evaluation.py` scores the ComFe generalisation runs against the completed workbooks
