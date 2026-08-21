@@ -16,7 +16,7 @@ do — move a completed workbook into `labelled_sheets/` and it will be excluded
 
 Input defaults to:
 
-    /home/mannixe/FLIP/flip-geoimage-dataset-builder/original_new_2026_07_24_generalisation/dataset.csv
+    /home/mannixe/FLIP/flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation/dataset.csv
 
 ## NSW case studies
 
@@ -60,6 +60,84 @@ Latest pull
     python make_spreadsheet.py \
         --sources gisborne \
         --output output/2026_08_21_generalisation_relabel_farm_and_image_gisborne.xlsx
+
+## Generalisatoin extra data
+
+A second builder run covering nine new `Lot_*` reaches alongside more farms from the four
+Victorian ones. None of its 1,420 farms appear in the main pull, so every reach is worth
+building. The `Lot_*` shapefiles need the `lot_` prefix on `--sources`, and the outputs
+are named `..._extra_...` so they do not collide with the runs above.
+
+    EXTRA=/home/mannixe/FLIP/flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation_extra/dataset.csv
+
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources lot_bega \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_bega.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources lot_caniaba \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_caniaba.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources lot_casino \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_casino.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources lot_corowa \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_corowa.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources lot_freemans \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_freemans.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources lot_hanwood \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_hanwood.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources lot_mangrove \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_mangrove.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources lot_nowra \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_nowra.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources lot_redlands \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_redlands.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources bacchusmarsh \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_bacchusmarsh.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources balliang \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_balliang.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources gisborne \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_gisborne.xlsx
+    python make_spreadsheet.py \
+        --input $EXTRA \
+        --sources wyuna \
+        --output output/2026_08_21_generalisation_extra_relabel_farm_and_image_wyuna.xlsx
+
+Sizes, for picking an order to work through them:
+
+    bega            188 farms    226 images
+    caniaba          11 farms     49 images
+    casino          264 farms    331 images
+    corowa          100 farms    157 images
+    freemans         57 farms    108 images
+    hanwood         266 farms    413 images
+    mangrove         19 farms     37 images
+    nowra            13 farms     44 images
+    redlands         13 farms    101 images
+    bacchusmarsh    234 farms    515 images
+    balliang         55 farms    191 images
+    gisborne         69 farms    145 images
+    wyuna           131 farms    305 images
 
 ## options
 
