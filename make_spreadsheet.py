@@ -3,8 +3,9 @@
 The input is either the original relabelling .xlsx or the dataset builder's dataset.csv;
 farms already covered by a workbook in --exclude-labelled are dropped.
 
-Sheet 1 ("Farm labels"): one row per Farm PFI, with the original label columns and a
-fixed-option confidence dropdown (High/Medium/Low) next to each label.
+Sheet 1 ("Farm labels"): one row per farm, keyed on the builder's farm UID with the
+Farm PFI alongside it, with the original label columns and a fixed-option confidence
+dropdown (High/Medium/Low) next to each label.
 
 Sheet 2 ("Image labels"): one row per image, as the input sheet stands, with the
 one-hot label columns replaced by a single dropdown holding the existing classes plus
@@ -26,13 +27,14 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 DEFAULT_INPUT = Path(
     "/home/mannixe/FLIP/flip-geoimage-dataset-builder/"
-    "original_new_2026_07_24_generalisation/dataset.csv"
+    "original_new_2026_08_21_generalisation/dataset.csv"
 )
-DEFAULT_OUTPUT = Path("output/2026_07_24_generalisation_relabel_farm_and_image_nsw.xlsx")
+DEFAULT_OUTPUT = Path("output/2026_08_21_generalisation_relabel_farm_and_image_nsw.xlsx")
 DEFAULT_LABELLED = Path("labelled_sheets")
 
 # Columns in the input sheet that describe the farm/image rather than the label.
 KEY_COLUMNS = [
+    "Farm UID",
     "source",
     "Farm PFI",
     "source_image_path",
@@ -42,6 +44,9 @@ IMAGE_COLUMN = "image_path"
 COMMENTS_COLUMN = "Comments"
 COUNT_COLUMN = "n_images"
 IMAGE_LABEL_COLUMN = "Label"
+# The farm's identity: the builder's UID is the primary key, with the PFI kept
+# alongside it because the earlier sheets and the evaluation join on that.
+UID_COLUMN = "Farm UID"
 PFI_COLUMN = "Farm PFI"
 
 # Only these reaches are kept; matched case-insensitively against the start of `source`.
@@ -65,6 +70,7 @@ CSV_LABELS = [
     "residential",
 ]
 CSV_COLUMNS = {
+    UID_COLUMN: "farm_uid",
     "source": "source",
     PFI_COLUMN: "PFI",
     "source_image_path": "source_image_path",
@@ -73,6 +79,7 @@ CSV_COLUMNS = {
 }
 # Widths taken from the original relabelling workbook; the rest keep Excel's default.
 CSV_WIDTHS = {
+    UID_COLUMN: 24.0,
     "source": 24.0,
     PFI_COLUMN: 34.0,
     "source_image_path": 55.28,
@@ -187,9 +194,13 @@ def filter_sources(rows: list[dict], sources: list[str]) -> list[dict]:
     return [row for row in rows if str(row["source"]).lower().startswith(wanted)]
 
 
-def labelled_pfis(directory: Path) -> set[str]:
-    """Every Farm PFI appearing in a workbook under `directory`, as strings."""
-    pfis: set[str] = set()
+def labelled_farms(directory: Path) -> set[str]:
+    """Every Farm UID and Farm PFI appearing in a workbook under `directory`.
+
+    Both identifiers are collected, as strings and in one set: a sheet written
+    before the UID existed only carries PFIs, and either one marks a farm done.
+    """
+    farms: set[str] = set()
     for path in sorted(directory.glob("*.xlsx")):
         if path.name.startswith("~$"):  # Excel's lock files
             continue
@@ -197,17 +208,24 @@ def labelled_pfis(directory: Path) -> set[str]:
         for sheet in workbook.worksheets:
             rows = sheet.iter_rows(values_only=True)
             header = next(rows, None) or ()
-            if PFI_COLUMN not in header:
+            indices = [header.index(name) for name in (UID_COLUMN, PFI_COLUMN) if name in header]
+            if not indices:
                 continue
-            index = header.index(PFI_COLUMN)
-            pfis.update(str(values[index]) for values in rows if values[index] is not None)
+            for values in rows:
+                farms.update(
+                    str(values[index]) for index in indices if values[index] is not None
+                )
         workbook.close()
-    return pfis
+    return farms
 
 
-def drop_labelled(rows: list[dict], pfis: set[str]) -> list[dict]:
+def drop_labelled(rows: list[dict], farms: set[str]) -> list[dict]:
     """Drop every image of a farm that has already been through a labelling sheet."""
-    return [row for row in rows if str(row[PFI_COLUMN]) not in pfis]
+    return [
+        row
+        for row in rows
+        if str(row.get(UID_COLUMN)) not in farms and str(row[PFI_COLUMN]) not in farms
+    ]
 
 
 def label_columns(header: list[str]) -> list[str]:
@@ -217,16 +235,21 @@ def label_columns(header: list[str]) -> list[str]:
     return header[start:end]
 
 
+def farm_key(row: dict) -> object:
+    """The farm a row belongs to: its UID, falling back to the PFI without one."""
+    return row.get(UID_COLUMN) or row[PFI_COLUMN]
+
+
 def group_by_farm(rows: list[dict]) -> list[dict]:
-    """One record per Farm PFI, keeping first-seen order and image counts."""
+    """One record per farm, keeping first-seen order and image counts."""
     farms: dict[object, dict] = {}
     for row in rows:
-        pfi = row["Farm PFI"]
-        farm = farms.get(pfi)
+        key = farm_key(row)
+        farm = farms.get(key)
         if farm is None:
-            farm = {key: row[key] for key in KEY_COLUMNS}
+            farm = {name: row.get(name) for name in KEY_COLUMNS}
             farm[COUNT_COLUMN] = 0
-            farms[pfi] = farm
+            farms[key] = farm
         farm[COUNT_COLUMN] += 1
     return list(farms.values())
 
@@ -380,12 +403,12 @@ def build_image_sheet(workbook, rows: list[dict], image_options: list[str], widt
     band = 0
     for index, row in enumerate(rows):
         sheet.append(
-            [row[key] for key in KEY_COLUMNS]
+            [row.get(key) for key in KEY_COLUMNS]
             + [row[IMAGE_COLUMN], None, row.get(COMMENTS_COLUMN)]
         )
         # Shading alternates per farm, and each farm is closed off with a medium rule.
         last_of_farm = (
-            index == len(rows) - 1 or rows[index + 1]["Farm PFI"] != row["Farm PFI"]
+            index == len(rows) - 1 or farm_key(rows[index + 1]) != farm_key(row)
         )
         style_row(
             sheet,
@@ -440,7 +463,7 @@ def main() -> None:
         rows = filter_sources(rows, args.sources)
         if not rows:
             parser.error(f"no rows match sources {args.sources}")
-    done = labelled_pfis(args.exclude_labelled) if args.exclude_labelled else set()
+    done = labelled_farms(args.exclude_labelled) if args.exclude_labelled else set()
     if done:
         rows = drop_labelled(rows, done)
         if not rows:
@@ -461,7 +484,7 @@ def main() -> None:
 
     print(f"{args.input} -> {args.output}")
     print(f"  sources: {', '.join(sorted({row['source'] for row in rows}))}")
-    print(f"  excluded: {len(done)} farms already labelled in {args.exclude_labelled}")
+    print(f"  excluded: {len(done)} farm ids already labelled in {args.exclude_labelled}")
     print(f"  {FARM_SHEET}: {len(farms)} farms x {len(labels)} labels (+ confidence)")
     print(f"  {IMAGE_SHEET}: {len(rows)} images, {len(image_options)} dropdown options")
 
