@@ -28,15 +28,27 @@ Because there are now four model families rather than two, there is no single ba
 every pair of models is differenced on the same bootstrap resamples and the per-class
 pairwise table carries all of them.
 
-The ComFe 2026-08-21 runs are still training. Runs without a saved prediction are skipped
-with a note, and the family is reported as pending; rerun once they land and it fills in.
+*Half the vocabulary is too thinly sampled to rank on.* Five of the nine shared classes
+were trained on 14 crops or fewer, and three carry single-digit test positives -
+`commercialpig` has four training crops and eight positives, `sheep` four and five. Their
+AP is real but its bootstrap interval spans most of the unit range, and an unweighted
+macro gives them the same weight as `residential`'s 102 positives, which is enough for
+three uninformative numbers to invert the headline. So the per-class table carries the
+training count beside the positives, dims any class short of either
+MIN_TRAIN_EXAMPLES or MIN_POSITIVES, marks any AP whose own interval is at least
+WIDE_INTERVAL wide, and reports a third macro over the classes that clear both bars. The
+starved classes are dimmed rather than dropped: not doing `commercialpig` on four
+examples is a genuine weakness, it just is not a *ranking*.
+
+Runs without a saved prediction are skipped with a note and the family is reported as
+pending; rerun once they land and it fills in.
 
 Writes the CSVs *and* the self-contained HTML dashboard into `output_eval_2026_08_21/`.
 
 Usage:
 
     .venv/bin/python gen_evaluation_2026_08_21.py
-    .venv/bin/python gen_evaluation_2026_08_21.py --aggregation mean --bootstrap 4000
+    .venv/bin/python gen_evaluation_2026_08_21.py --aggregation top2 --bootstrap 4000
 """
 
 from __future__ import annotations
@@ -122,7 +134,29 @@ UNMODELLED_CLASSES = ["goats"]
 ALL_CLASSES = SHARED_CLASSES + NEW_ONLY_CLASSES + LEGACY_ONLY_CLASSES + UNMODELLED_CLASSES
 
 MACRO = "MACRO (evaluable)"
+MACRO_SHARED = "MACRO (shared 9)"
+MACRO_SAMPLED = "MACRO (well sampled)"
 LEVELS = {"crop": "crop", "farm": "farm"}
+
+# What counts as enough data to say anything about a class.
+#
+# Half this vocabulary is trained on single-digit examples, and a class with four training
+# crops and five test positives produces an AP whose bootstrap interval spans most of the
+# unit range - `old` scores 0.29 on sheep with a 95 % interval of [0.01, 0.70]. Those
+# numbers carry no information, but an unweighted macro gives them the same weight as
+# residential's 102 positives, so three of them are enough to invert the headline. The
+# macro is therefore reported a third way, over the classes that clear both bars, and the
+# rule is deliberately a property of the *data* rather than of any model's scores so that
+# the subset cannot be chosen to flatter a model.
+MIN_TRAIN_EXAMPLES = 6
+MIN_POSITIVES = 10
+# A per-class interval at least this wide is flagged in the table: the estimate is too
+# loose to rank models with, whatever its point value.
+WIDE_INTERVAL = 0.40
+
+# The training split the 2026-08-21 models were fitted on, read only for its per-class
+# counts so the table can show what each class was actually trained on.
+TRAIN_CSV = BUILDER / "original_new_2026_08_21_generalisation" / "relabelled_train_df.csv"
 
 # The four model families, in the categorical-slot order the dashboard paints them.
 # `runs` is either an explicit directory of seed runs (legacy) or a (directory, substring)
@@ -339,8 +373,20 @@ def farm_truth(farms: pd.DataFrame) -> pd.DataFrame:
 
 
 def farm_scores(scores: np.ndarray, keys: np.ndarray, order: np.ndarray, how: str) -> np.ndarray:
-    """Aggregate per-crop scores up to one score per farm, in `order`."""
-    frame = pd.DataFrame(scores).groupby(keys).agg(how)
+    """Aggregate per-crop scores up to one score per farm, in `order`.
+
+    `max` is the natural reading - a farm runs dairy if any one of its buildings is a
+    dairy - but it is also the noisiest, since a single over-confident crop sets the
+    farm's score outright. `top2` averages the two highest-scoring crops instead, which
+    costs nothing and is steadier at the ~4.7 crops per farm this build carries.
+    """
+    grouped = pd.DataFrame(scores).groupby(keys)
+    if how == "top2":
+        frame = grouped.apply(
+            lambda block: block.apply(lambda column: column.nlargest(2).mean())
+        )
+    else:
+        frame = grouped.agg(how)
     return frame.reindex(order).to_numpy()
 
 
@@ -376,12 +422,27 @@ def interval_of(draws: np.ndarray) -> tuple[float, float]:
     return float(low), float(high)
 
 
+def train_counts(train: pd.DataFrame) -> dict[str, int]:
+    """How many training crops carry each class, off the split's `binary_*` columns.
+
+    Used at both levels: the models are fitted on crops either way, so the crop count is
+    what a farm-level class was trained on too.
+    """
+    return {
+        name: int(train[f"binary_{name}"].to_numpy(dtype=float).sum())
+        if f"binary_{name}" in train.columns
+        else 0
+        for name in ALL_CLASSES
+    }
+
+
 def evaluate(
     level: str,
     truth: pd.DataFrame,
     models: list[dict],
     reps: int,
     seed: int,
+    trained: dict[str, int],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Per-class AP for every model, plus the all-pairs paired differences.
 
@@ -398,12 +459,19 @@ def evaluate(
         y_true = truth[name].to_numpy()
         positives = int(y_true.sum())
         evaluable = 0 < positives < n
+        n_train = trained.get(name, 0)
         row = {
             "level": level,
             "class": name,
             "n": n,
+            "n_train": n_train,
             "positives": positives,
             "prevalence": positives / n if n else np.nan,
+            # Model-independent: it asks whether the data can support a comparison at all,
+            # not whether any particular model did well.
+            "well_sampled": bool(
+                n_train >= MIN_TRAIN_EXAMPLES and positives >= MIN_POSITIVES
+            ),
         }
 
         draws: dict[str, np.ndarray] = {}
@@ -425,6 +493,7 @@ def evaluate(
             draws[key] = bootstrap_ap(y_true, y_score, resamples)
             low, high = interval_of(draws[key])
             row[f"{key}|AP_lo"], row[f"{key}|AP_hi"] = low, high
+            row[f"{key}|AP_ci"] = float(high - low) if np.isfinite(low) and np.isfinite(high) else np.nan
             per_seed = [
                 float(average_precision_score(y_true, scores_for(model, name, s)))
                 for s in model["seeds"]
@@ -462,13 +531,28 @@ def evaluate(
 
     # The macro is the unweighted mean over the classes a model can actually score, so it
     # is NOT a like-for-like number across the two generations: the new models average in
-    # paddock and other_industrial, which the old ones have no output for. Both a macro
-    # over each model's own scoreable classes and one restricted to the nine shared
-    # classes are reported, and the shared one is what the headline comparison uses.
+    # paddock and other_industrial, which the old ones have no output for. Three macros are
+    # reported:
+    #
+    #   MACRO (evaluable)    each model over its own scoreable classes - not comparable
+    #                        across generations, but it is what each model actually does.
+    #   MACRO (shared 9)     the nine classes every model emits - like for like on
+    #                        vocabulary, but five of those nine have <= 14 training crops
+    #                        and three have single-digit test positives, so it is dominated
+    #                        by estimates whose intervals span most of the unit range.
+    #   MACRO (well sampled) the shared classes that clear MIN_TRAIN_EXAMPLES and
+    #                        MIN_POSITIVES - like for like on vocabulary *and* carrying
+    #                        enough data to rank models with. This is the honest headline.
+    #
+    # All three are kept rather than one replaced, because dropping the starved classes
+    # hides a real weakness: the new models genuinely cannot do commercialpig or sheep on
+    # four training examples. The point is only that those classes cannot be *ranked*.
     macro_rows = []
+    well = [name for name in SHARED_CLASSES if table.loc[table["class"] == name, "well_sampled"].any()]
     for label, subset in (
         (MACRO, None),
-        ("MACRO (shared 9)", SHARED_CLASSES),
+        (MACRO_SHARED, SHARED_CLASSES),
+        (MACRO_SAMPLED, well),
     ):
         macro = {"level": level, "class": label, "n": n}
         for model in scored:
@@ -484,6 +568,7 @@ def evaluate(
             macro[f"{key}|status"] = "scored"
             macro["positives"] = int(usable["positives"].sum())
             macro["prevalence"] = float(usable["prevalence"].mean())
+            macro["n_train"] = int(usable["n_train"].sum())
         macro_rows.append(macro)
 
     return pd.concat([table, pd.DataFrame(macro_rows)], ignore_index=True), pd.DataFrame(pairs)
@@ -1268,6 +1353,18 @@ table { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size
 .data thead th { color: var(--muted); font-weight: 500; font-size: 11.5px; white-space: nowrap; }
 .data tbody th { text-align: left; font-weight: 500; white-space: nowrap; }
 .data tr.total th, .data tr.total td { font-weight: 650; border-top: 1px solid var(--axis); }
+.data tr.headline th, .data tr.headline td { background: var(--tint-row, color-mix(in srgb, var(--ink) 5%, transparent)); }
+/* Not enough training crops or test positives for the AP to separate models. Dimmed
+   rather than dropped: the weakness is real, it just cannot be ranked. */
+.data tr.starved th, .data tr.starved td { color: var(--muted); }
+.data tr.starved th { font-style: italic; }
+/* A single estimate whose own interval is too wide to read a ranking off. */
+.data td.loose { position: relative; }
+.data td.loose::after {
+  content: "~"; position: absolute; left: 2px; top: 50%; transform: translateY(-50%);
+  color: var(--muted); font-size: 10px;
+}
+.table-note { font-size: 12px; color: var(--ink-2); margin: 10px 0 0; max-width: 78ch; line-height: 1.5; }
 .muted { color: var(--muted); font-weight: 400; font-size: 11px; }
 .rowcount { color: var(--muted); font-size: 11px; margin-left: 8px; font-weight: 400; }
 
@@ -1378,35 +1475,56 @@ def roster_card(models: list[dict]) -> str:
 
 
 def macro_tiles(metrics: pd.DataFrame, models: list[dict]) -> str:
-    """The headline number, restricted to the nine classes every model can emit.
+    """The headline numbers: the shared-9 macro beside the well-sampled one.
 
-    Deliberately the shared-9 macro rather than each model's own: the new models can score
-    paddock, which is 57 % of the crops and by far the easiest class here, so a macro over
-    each model's own vocabulary would hand them a large lead that has nothing to do with
-    being better at the livestock classes.
+    The shared-9 macro is like for like on *vocabulary* - a macro over each model's own
+    classes would hand the new generation paddock, 57 % of the crops and by far the
+    easiest class here, for nothing. But it is not like for like on *evidence*: five of
+    those nine classes were trained on <= 14 crops and three carry single-digit test
+    positives, and an unweighted mean gives a four-example class the same say as a
+    102-positive one. Both are shown, with the well-sampled macro marked as the one to
+    rank on and the gap between them left visible rather than reconciled.
     """
     scored = [m for m in models if m["ensemble"] is not None]
     tiles = []
     for level in LEVELS:
-        row = metrics[
-            (metrics["level"] == level) & (metrics["class"] == "MACRO (shared 9)")
-        ]
-        if row.empty:
+        rows = {
+            label: metrics[(metrics["level"] == level) & (metrics["class"] == label)]
+            for label in (MACRO_SHARED, MACRO_SAMPLED)
+        }
+        if rows[MACRO_SHARED].empty:
             continue
-        row = row.iloc[0]
-        cells = "".join(
-            f'<tr><th scope="row">'
-            f'<i class="key-line" style="background:var(--series-{m["key"]})"></i>'
-            f'{escape(m["key"])}</th>'
-            f'<td>{row[f"{m['key']}|AP"]:.3f}</td></tr>'
-            for m in scored
-            if pd.notna(row.get(f"{m['key']}|AP"))
+        shared, sampled = rows[MACRO_SHARED].iloc[0], (
+            rows[MACRO_SAMPLED].iloc[0] if not rows[MACRO_SAMPLED].empty else None
+        )
+        body = []
+        for m in scored:
+            key = m["key"]
+            if pd.isna(shared.get(f"{key}|AP")):
+                continue
+            best = sampled.get(f"{key}|AP") if sampled is not None else np.nan
+            body.append(
+                f'<tr><th scope="row">'
+                f'<i class="key-line" style="background:var(--series-{key})"></i>'
+                f"{escape(key)}</th>"
+                f'<td class="muted">{shared[f"{key}|AP"]:.3f}</td>'
+                f"<td>{'-' if pd.isna(best) else f'{best:.3f}'}</td></tr>"
+            )
+        n_classes = (
+            int(sampled.get(f"{scored[0]['key']}|n_classes", 0))
+            if sampled is not None
+            else 0
         )
         tiles.append(
             f'<div class="tile"><p class="tile-label">macro AP, {escape(level)} level</p>'
-            f'<table class="mini"><tbody>{cells}</tbody></table>'
-            f'<p class="tile-note">unweighted mean over the nine classes every model can '
-            f'emit, so the comparison is like for like</p></div>'
+            f'<table class="mini"><thead><tr><th></th>'
+            f'<th class="muted">shared 9</th><th>well sampled</th></tr></thead>'
+            f"<tbody>{''.join(body)}</tbody></table>"
+            f'<p class="tile-note">both are unweighted means over classes every model can '
+            f'emit. <b>well sampled</b> keeps only the {n_classes} of those nine with at '
+            f'least {MIN_TRAIN_EXAMPLES} training crops and {MIN_POSITIVES} test '
+            f'positives - the rest are estimated too loosely to rank on. Rank on the '
+            f'right-hand column.</p></div>'
         )
     return "".join(tiles)
 
@@ -1462,7 +1580,7 @@ def metrics_table(metrics: pd.DataFrame, models: list[dict], level: str) -> str:
     rows = metrics[metrics["level"] == level]
     scored = [m for m in models if m["ensemble"] is not None]
     head = (
-        "<tr><th>class</th><th>positives</th><th>prevalence</th>"
+        "<tr><th>class</th><th>train</th><th>positives</th><th>prevalence</th>"
         + "".join(
             f'<th><i class="key-line" style="background:var(--series-{m["key"]})"></i>'
             f"AP {escape(m['key'])}</th>"
@@ -1486,20 +1604,37 @@ def metrics_table(metrics: pd.DataFrame, models: list[dict], level: str) -> str:
                     if pd.isna(low)
                     else f' <span class="muted">[{low:.2f}, {high:.2f}]</span>'
                 )
-                cells.append(f"<td>{value:.3f}{bounds}</td>")
+                width = row.get(f"{model['key']}|AP_ci")
+                loose = ' class="loose"' if pd.notna(width) and width >= WIDE_INTERVAL else ""
+                cells.append(f"<td{loose}>{value:.3f}{bounds}</td>")
         for model in scored:
             value = row.get(f"{model['key']}|AUC")
             cells.append("<td>-</td>" if pd.isna(value) else f"<td>{value:.3f}</td>")
-        emphasis = ' class="total"' if str(row["class"]).startswith("MACRO") else ""
+        label = str(row["class"])
+        classes = []
+        if label.startswith("MACRO"):
+            classes.append("total")
+            if label == MACRO_SAMPLED:
+                classes.append("headline")
+        elif not row.get("well_sampled", True):
+            # Too few training examples or too few test positives to rank models on.
+            classes.append("starved")
+        emphasis = f' class="{" ".join(classes)}"' if classes else ""
         positives = "" if pd.isna(row.get("positives")) else int(row["positives"])
         prevalence = "" if pd.isna(row.get("prevalence")) else f"{row['prevalence']:.3f}"
+        trained = "" if pd.isna(row.get("n_train")) else int(row["n_train"])
         body.append(
-            f'<tr{emphasis}><th scope="row">{escape(row["class"])}</th>'
-            f"<td>{positives}</td><td>{prevalence}</td>{''.join(cells)}</tr>"
+            f'<tr{emphasis}><th scope="row">{escape(label)}</th>'
+            f"<td>{trained}</td><td>{positives}</td><td>{prevalence}</td>{''.join(cells)}</tr>"
         )
     return (
         f'<div class="scroll"><table class="data"><thead>{head}</thead>'
         f"<tbody>{''.join(body)}</tbody></table></div>"
+        f'<p class="table-note"><b>train</b> is the number of crops carrying that class in the '
+        f'2026-08-21 training split, which is what the multilabel models were fitted on. '
+        f'Dimmed rows fall short of either bar - {MIN_TRAIN_EXAMPLES} training crops or '
+        f'{MIN_POSITIVES} test positives - so their AP cannot separate models; an AP cell '
+        f'is marked when its own 95 % interval is at least {WIDE_INTERVAL:.2f} wide.</p>'
     )
 
 
@@ -1774,10 +1909,10 @@ def main() -> None:
     parser.add_argument(
         "--aggregation",
         default="max",
-        choices=["max", "mean"],
+        choices=["max", "mean", "top2"],
         help="how a farm's per-crop scores become one farm score (default max)",
     )
-    parser.add_argument("--bootstrap", type=int, default=2000, help="bootstrap resamples")
+    parser.add_argument("--bootstrap", type=int, default=200, help="bootstrap resamples")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, default=OUTPUT)
     parser.add_argument("--file", type=Path, default=None, help="where to write the dashboard")
@@ -1785,7 +1920,12 @@ def main() -> None:
 
     test = pd.read_csv(TEST_CSV, keep_default_na=False)
     legacy = pd.read_csv(LEGACY_DATASET, keep_default_na=False)
+    train = pd.read_csv(TRAIN_CSV, keep_default_na=False)
+    trained = train_counts(train)
     print(f"{TEST_CSV.name}: {len(test)} crops, {test['farm_uid'].nunique()} farms")
+    print(f"{TRAIN_CSV.name}: {len(train)} crops, per class: " + ", ".join(
+        f"{name} {trained[name]}" for name in ALL_CLASSES if trained[name]
+    ))
 
     # Map the legacy prediction rows onto the test crops.
     row_of = pd.Series(np.arange(len(legacy)), index=pd.MultiIndex.from_frame(legacy[JOIN_KEY]))
@@ -1848,7 +1988,7 @@ def main() -> None:
     metrics, pairs, regions, agreement = [], [], [], []
     for level in LEVELS:
         table, pair = evaluate(
-            level, truths[level], by_level[level], args.bootstrap, args.seed
+            level, truths[level], by_level[level], args.bootstrap, args.seed, trained
         )
         metrics.append(table)
         pairs.append(pair)
@@ -1888,14 +2028,16 @@ def main() -> None:
     for level in LEVELS:
         title = f"{level} level - average precision per class"
         print(f"\n{title}\n" + "-" * len(title))
-        header = f"{'class':<18}{'pos':>5}{'prev':>7}"
+        header = f"{'class':<20}{'train':>6}{'pos':>5}{'prev':>7}"
         for model in scored:
             header += f"{model['key']:>22}"
         print(header)
         for _, row in metrics[metrics["level"] == level].iterrows():
             positives = "" if pd.isna(row.get("positives")) else int(row["positives"])
             prevalence = "" if pd.isna(row.get("prevalence")) else f"{row['prevalence']:.3f}"
-            line = f"{row['class']:<18}{positives:>5}{prevalence:>7}"
+            trained = "" if pd.isna(row.get("n_train")) else int(row["n_train"])
+            mark = "" if row.get("well_sampled", True) or str(row["class"]).startswith("MACRO") else " *"
+            line = f"{str(row['class']) + mark:<20}{trained:>6}{positives:>5}{prevalence:>7}"
             for model in scored:
                 value = row.get(f"{model['key']}|AP")
                 if pd.isna(value):
@@ -1906,7 +2048,12 @@ def main() -> None:
                     bounds = "" if pd.isna(low) else f" [{low:.2f},{high:.2f}]"
                     line += f"{f'{value:.3f}{bounds}':>22}"
             print(line)
-        print("prev = prevalence, the AP a random ranker scores. 95% bootstrap intervals.")
+        print(
+            "prev = prevalence, the AP a random ranker scores. 95% bootstrap intervals.\n"
+            f"* = fewer than {MIN_TRAIN_EXAMPLES} training crops or {MIN_POSITIVES} test "
+            f"positives; scored but too loosely estimated to rank models on, and excluded\n"
+            f"    from {MACRO_SAMPLED}."
+        )
 
     # ---- outputs ---------------------------------------------------------------------
     metrics.to_csv(args.output / "evaluation.csv", index=False)
