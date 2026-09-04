@@ -1,0 +1,758 @@
+"""Combine the three FLIP datasets into one master corpus with four named test sets.
+
+    1  autocrops       flip-geoimage-dataset-builder/original_new_2026_08_21
+                       building crops cut from ECW aerial imagery, farm-level labels
+    2  generalisation  flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation
+                       the same kind of crops, but crop-level labels from the workbooks
+    3  historical      flip-dataset-processing/output/flip_historical
+                       whole-farm images from the original pipeline
+
+These are not three independent collections. (1) and (3) are two different crops of the
+same underlying source photographs — 2,398 source-image names in common — and (2) is the
+crop-level relabelling of exactly the imagery (3) holds whole in gen_all_df.csv. Combining
+them therefore has to resolve overlap explicitly rather than assume it away.
+
+Test wins: a train/val row whose farm_uid or source-image stem appears in any of the four
+test sets is pulled out of train/val. Nothing is deleted — pulled rows go to
+train_overlap.csv / val_overlap.csv and their imagery is copied like any other row, so
+every input row appears exactly once somewhere in the output.
+
+The one exception is gen_all, which is split by (2)'s split *before* the test pool is
+built. A literal test-wins would otherwise send 100% of (2)'s train/val to overlap, since
+all of it sits inside gen_all; instead the gen_all images whose crops are in (2)'s
+train/val go to test_gen_original_overlap.csv and the rest form test_gen_original.csv.
+That keeps (2)'s training rows and leaves test_gen_original genuinely held out.
+
+gen_all also contains the source images behind test_autocrop_gen_vic. Both are test sets,
+so there is no train leakage, and both are kept because they measure different things —
+whole-image old labels against crop-level new labels. Rows in both carry it in
+overlap_with. Never pool scores across the two.
+
+Grouping. Training is multi-label at the level the label was actually assigned, which
+differs by source: for (1) that is the farm (one farm-level label shared by all its
+crops), for (2) and (3) it is the single image. group_id is prefixed with the source
+dataset because (1) and (2) share 24 farm_uids and a bare farm_uid would silently merge a
+farm-level group with the image-level groups of the same farm across two datasets whose
+splits were assigned independently. Groups never span datasets; the raw farm_uid stays on
+every row so merging them later remains a deliberate act.
+
+Output goes to original_master_2026_09_04/ — the csvs and README at the top, each source's
+imagery copied into its own subfolder at its original relative path.
+"""
+
+import argparse
+import collections
+import os
+import shutil
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+DEFAULT_AUTOCROPS = Path(
+    "/home/mannixe/FLIP/flip-geoimage-dataset-builder/original_new_2026_08_21"
+)
+DEFAULT_GENERALISATION = Path(
+    "/home/mannixe/FLIP/flip-geoimage-dataset-builder/"
+    "original_new_2026_08_21_generalisation"
+)
+DEFAULT_HISTORICAL = Path(
+    "/home/mannixe/FLIP/flip-dataset-processing/output/flip_historical"
+)
+DEFAULT_OUTPUT = Path("original_master_2026_09_04")
+
+# Each source's imagery is copied into its own subfolder, so the two sources that share
+# source photographs cannot collide and each subfolder stays self-contained.
+SUBDIR = {
+    "autocrops": "autocrops",
+    "generalisation": "generalisation",
+    "historical": "historical",
+}
+
+# The union of all three sources' classes. (1) carries 11, (2) adds paddock and
+# other_industrial, (3) has 10 (no goats). A class its source never assessed is written
+# False, which means "not assessed", not "verified absent" — see the README.
+CLASSES = [
+    "aqua", "backyardpig", "beef", "commercialpig", "dairy", "freerangepig",
+    "goats", "horse", "poultry", "residential", "sheep",
+    "paddock", "other_industrial",
+]
+BINARY = ["binary_" + cls for cls in CLASSES]
+
+# split name -> output csv. Order is the order they are reported in.
+SPLIT_FILES = {
+    "train": "train_df.csv",
+    "val": "val_df.csv",
+    "train_overlap": "train_overlap.csv",
+    "val_overlap": "val_overlap.csv",
+    "test_autocrops": "test_autocrops.csv",
+    "test_autocrop_gen_vic": "test_autocrop_gen_vic.csv",
+    "test_gen_original": "test_gen_original.csv",
+    "test_gen_original_overlap": "test_gen_original_overlap.csv",
+    "test_original": "test_original.csv",
+}
+# The splits whose farms and source images the train/val rows are held out from.
+# test_gen_original_overlap is deliberately not among them: it is the part of gen_all
+# that lost to (2)'s split, so holding training out from it would defeat the exception.
+TEST_SPLITS = [
+    "test_autocrops", "test_autocrop_gen_vic", "test_gen_original", "test_original",
+]
+TRAIN_SPLITS = ["train", "val"]
+OVERLAP_OF = {"train": "train_overlap", "val": "val_overlap"}
+
+VAL_FRACTION = 0.20
+RANDOM_STATE = 42
+
+PROVENANCE_COLUMNS = [
+    "source_dataset", "source_dataset_path", "source_file", "source_split",
+    "label_level", "label_status",
+]
+GROUP_COLUMNS = ["group_id", "group_level", "group_size"]
+IDENTITY_COLUMNS = [
+    "image_path", "source_relpath", "source_image_path", "source_image_relpath",
+    "source_image_name", "source_image_stem", "farm_uid",
+]
+LABEL_COLUMNS = ["processed_class", "crop_classes", "n_classes"]
+OVERLAP_COLUMNS = ["overlap_with", "overlap_reason"]
+# Carried through where the source has them, blank elsewhere.
+EXTRA_COLUMNS = [
+    "Farm_type", "PFI", "source", "region", "Lat", "Long", "ecw_stem",
+    "building_cluster", "crop_width", "crop_height", "crop_res", "crop_std",
+    "crop_fill_frac", "blank_reason", "crop_label", "crop_comments", "farm_labels",
+    "farm_processed_class", "label_workbook", "image_classes", "in_gen_labelled",
+    "in_train_exceptions", "in_test_data", "in_gen_data", "in_hpai_data",
+    "in_train_data",
+]
+COLUMNS = (
+    PROVENANCE_COLUMNS + GROUP_COLUMNS + IDENTITY_COLUMNS + LABEL_COLUMNS
+    + OVERLAP_COLUMNS + BINARY + EXTRA_COLUMNS + ["split"]
+)
+
+
+def stem(name):
+    """Source-image name -> the cross-dataset join key.
+
+    (1) and (2) record it as `filename`, (3) as `image_name`, and the same photograph can
+    appear as .png in one and .PNG in another, so the key is lower-cased and stripped of
+    its extension.
+    """
+    return os.path.splitext(str(name))[0].lower()
+
+
+def read_csv(path):
+    return pd.read_csv(path, dtype={"building_cluster": str, "PFI": str})
+
+
+def normalise(df, dataset, root, source_file, source_split, label_level,
+              image_path, source_image_path, source_image_name, group_key):
+    """One source's rows in the unified schema, with provenance stamped on.
+
+    The caller passes the source's own column names for the four things every source
+    names differently — where the image is, where its source photograph is, what that
+    photograph is called, and what identifies the group — and everything else is either
+    carried through under its own name or derived from the binary_ columns.
+    """
+    out = pd.DataFrame(index=df.index)
+    out["source_dataset"] = dataset
+    out["source_dataset_path"] = str(root)
+    out["source_file"] = source_file
+    out["source_split"] = source_split
+    out["label_level"] = label_level
+
+    subdir = SUBDIR[dataset]
+    out["source_relpath"] = df[image_path].astype(str)
+    out["image_path"] = subdir + "/" + out["source_relpath"]
+    if source_image_path is None:
+        out["source_image_relpath"] = ""
+        out["source_image_path"] = ""
+    else:
+        out["source_image_relpath"] = df[source_image_path].fillna("").astype(str)
+        out["source_image_path"] = out["source_image_relpath"].map(
+            lambda p: f"{subdir}/{p}" if p else ""
+        )
+    out["source_image_name"] = df[source_image_name].fillna("").astype(str)
+    out["source_image_stem"] = out["source_image_name"].map(stem)
+    out["farm_uid"] = df["farm_uid"].astype(str) if "farm_uid" in df else ""
+
+    # the group is the unit the label was asserted over: the farm for (1), the image for
+    # (2) and (3). Prefixed with the dataset so groups never span datasets.
+    out["group_level"] = "farm" if group_key == "farm_uid" else "image"
+    key = df[group_key] if group_key in df else df[image_path]
+    out["group_id"] = dataset + ":" + key.astype(str)
+
+    # every source already carries its labels as binary_ columns; the class list is their
+    # union in canonical order, so it is derived the same way for all three
+    for cls, col in zip(CLASSES, BINARY):
+        out[col] = df[col].fillna(False).astype(bool) if col in df else False
+    positives = out[BINARY].to_numpy()
+    out["crop_classes"] = [
+        ",".join(cls for cls, hit in zip(CLASSES, row) if hit) for row in positives
+    ]
+    out["n_classes"] = positives.sum(axis=1)
+    out["processed_class"] = df["processed_class"].fillna("").astype(str)
+    # (3)'s gen_all carries 762 rows whose processed_class is a placeholder rather than a
+    # class and whose binary_ columns are all False. They are kept, but a loader has to
+    # be able to filter them out of training and scoring.
+    out["label_status"] = out["n_classes"].map(lambda n: "labelled" if n else "unlabelled")
+    out.loc[out["n_classes"] == 0, "label_status"] = out.loc[
+        out["n_classes"] == 0, "processed_class"
+    ].replace("", "unlabelled")
+
+    for column in EXTRA_COLUMNS:
+        if column in df.columns:
+            out[column] = df[column]
+    return out
+
+
+def load_autocrops(root):
+    """(1) — farm-level labels, so the group is the farm and its crops share one label."""
+    frames = []
+    for split in ("train", "val", "test"):
+        name = f"{split}_df.csv"
+        frames.append(normalise(
+            read_csv(root / name), "autocrops", root, name, split, "farm",
+            image_path="image_path", source_image_path="source_image_path",
+            source_image_name="filename", group_key="farm_uid",
+        ))
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_generalisation(root):
+    """(2) — crop-level labels from the workbooks, so each crop is its own group."""
+    frames = []
+    for split in ("train", "val", "test"):
+        name = f"relabelled_{split}_df.csv"
+        frames.append(normalise(
+            read_csv(root / name), "generalisation", root, name, split, "crop",
+            image_path="image_path", source_image_path="source_image_path",
+            source_image_name="filename", group_key="image_path",
+        ))
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_historical(root):
+    """(3) — one whole-farm image per row, so the group is the image.
+
+    gen_df.csv is a strict subset of gen_all_df.csv (166 of 928), so only gen_all is read
+    and the 166 are flagged with in_gen_labelled rather than counted twice.
+    """
+    labelled = {stem(x) for x in pd.read_csv(root / "gen_df.csv")["image_name"]}
+    frames = []
+    for split, name in [("train", "train_df.csv"), ("val", "val_df.csv"),
+                        ("test", "test_df.csv"), ("hpai", "hpai_df.csv"),
+                        ("gen_all", "gen_all_df.csv")]:
+        raw = pd.read_csv(root / name)
+        raw["in_gen_labelled"] = raw["image_name"].map(stem).isin(labelled)
+        frames.append(normalise(
+            raw, "historical", root, name, split, "farm",
+            image_path="image_files_out_rel", source_image_path=None,
+            source_image_name="image_name", group_key="image_files_out_rel",
+        ))
+    return pd.concat(frames, ignore_index=True)
+
+
+def split_hpai(df, val_fraction, random_state):
+    """Give ~val_fraction of the hpai rows to val, stratified on processed_class.
+
+    hpai_df.csv is disjoint from flip_historical's own train_df and val_df and carries no
+    split of its own, so one has to be assigned. Classes with fewer than two rows cannot
+    be stratified and stay in train.
+    """
+    hpai = df["source_file"] == "hpai_df.csv"
+    if not hpai.any():
+        return df
+    pool = df[hpai]
+    counts = pool["processed_class"].value_counts()
+    stratifiable = pool[pool["processed_class"].isin(counts[counts >= 2].index)]
+    df.loc[hpai, "source_split"] = "hpai/train"
+    if len(stratifiable) >= 2:
+        _, val = train_test_split(
+            stratifiable, test_size=val_fraction,
+            stratify=stratifiable["processed_class"], random_state=random_state,
+        )
+        df.loc[val.index, "source_split"] = "hpai/val"
+    return df
+
+
+def assign_splits(df, val_fraction, random_state):
+    """The new split for every row, before the overlap rule is applied.
+
+    gen_all is divided here rather than later: the images whose crops are in (2)'s
+    train/val go to test_gen_original_overlap so that (2)'s training rows survive the
+    test-wins rule that follows.
+    """
+    df = split_hpai(df, val_fraction, random_state)
+
+    generalisation_train = set(
+        df.loc[
+            (df["source_dataset"] == "generalisation")
+            & df["source_split"].isin(["train", "val"]),
+            "source_image_stem",
+        ]
+    )
+    gen_all = df["source_file"] == "gen_all_df.csv"
+    superseded = gen_all & df["source_image_stem"].isin(generalisation_train)
+
+    df["split"] = ""
+    for dataset, source_split, new in [
+        ("autocrops", "train", "train"), ("autocrops", "val", "val"),
+        ("autocrops", "test", "test_autocrops"),
+        ("generalisation", "train", "train"), ("generalisation", "val", "val"),
+        ("generalisation", "test", "test_autocrop_gen_vic"),
+        ("historical", "train", "train"), ("historical", "val", "val"),
+        ("historical", "hpai/train", "train"), ("historical", "hpai/val", "val"),
+        ("historical", "test", "test_original"),
+    ]:
+        df.loc[
+            (df["source_dataset"] == dataset) & (df["source_split"] == source_split),
+            "split",
+        ] = new
+    df.loc[gen_all & ~superseded, "split"] = "test_gen_original"
+    df.loc[superseded, "split"] = "test_gen_original_overlap"
+    return df
+
+
+def apply_test_wins(df):
+    """Pull train/val rows that reach into a test set out into the *_overlap splits.
+
+    A row is pulled when its farm or its source photograph is in one of the four test
+    sets. The pull is by whole group: a group is the unit a label was asserted over, so
+    half of one in train and half in overlap would be meaningless. In practice it never
+    has to divide one — every autocrops farm maps to exactly one source image — and the
+    assertions check that stays true.
+    """
+    held_out = df["split"].isin(TEST_SPLITS)
+    test_stems = set(df.loc[held_out, "source_image_stem"]) - {""}
+    test_farms = set(df.loc[held_out, "farm_uid"]) - {"", "nan"}
+
+    pool = df["split"].isin(TRAIN_SPLITS)
+    by_image = pool & df["source_image_stem"].isin(test_stems)
+    by_farm = pool & df["farm_uid"].isin(test_farms)
+    df["overlap_reason"] = ""
+    df.loc[by_farm, "overlap_reason"] = "farm_uid"
+    df.loc[by_image, "overlap_reason"] = "source_image"
+    df.loc[by_farm & by_image, "overlap_reason"] = "farm_uid,source_image"
+
+    # promote to whole groups, so a group is never divided between a split and its overlap
+    pulled_groups = set(df.loc[by_farm | by_image, "group_id"])
+    pulled = pool & df["group_id"].isin(pulled_groups)
+    df.loc[pulled & (df["overlap_reason"] == ""), "overlap_reason"] = "group"
+    for split, overlap in OVERLAP_OF.items():
+        df.loc[pulled & (df["split"] == split), "split"] = overlap
+    return df
+
+
+def annotate(df):
+    """group_size, and the other splits each row's farm or source image also appears in."""
+    df["group_size"] = df.groupby("group_id")["group_id"].transform("size")
+
+    by_stem = collections.defaultdict(set)
+    by_farm = collections.defaultdict(set)
+    for split, key in zip(df["split"], df["source_image_stem"]):
+        if key:
+            by_stem[key].add(split)
+    for split, key in zip(df["split"], df["farm_uid"]):
+        if key and key != "nan":
+            by_farm[key].add(split)
+    df["overlap_with"] = [
+        ",".join(sorted((by_stem[s] | by_farm[f]) - {split}))
+        for split, s, f in zip(df["split"], df["source_image_stem"], df["farm_uid"])
+    ]
+    return df
+
+
+def check(df, totals):
+    """Everything that must hold before a single file is written."""
+    problems = []
+    if len(df) != sum(totals.values()):
+        problems.append(f"row count {len(df)} != {sum(totals.values())} read in")
+    unknown = set(df["split"]) - set(SPLIT_FILES)
+    if unknown:
+        problems.append(f"rows landed in unknown splits: {sorted(unknown)}")
+
+    straddling = df.groupby("group_id")["split"].nunique()
+    straddling = straddling[straddling > 1]
+    if not straddling.empty:
+        problems.append(
+            f"{len(straddling)} group_ids appear in more than one split, e.g. "
+            f"{sorted(straddling.index)[:3]}"
+        )
+
+    duplicated = df["image_path"].duplicated()
+    if duplicated.any():
+        problems.append(f"{duplicated.sum()} image_path values appear more than once")
+
+    # the point of the whole exercise: no training row may reach into a test set
+    held_out = df["split"].isin(TEST_SPLITS)
+    test_stems = set(df.loc[held_out, "source_image_stem"]) - {""}
+    test_farms = set(df.loc[held_out, "farm_uid"]) - {"", "nan"}
+    training = df[df["split"].isin(TRAIN_SPLITS)]
+    leaked = (
+        training["source_image_stem"].isin(test_stems)
+        | training["farm_uid"].isin(test_farms)
+    )
+    if leaked.any():
+        problems.append(f"{leaked.sum()} train/val rows still reach a test split")
+    return problems
+
+
+def copy_imagery(df, output_dir, mode, workers=8):
+    """Put every row's imagery under output_dir at the path image_path already names.
+
+    Each source keeps its own subfolder, so the two that share source photographs each get
+    their own copy and neither subfolder depends on the other.
+    """
+    if mode == "none":
+        return 0, []
+    jobs = {}
+    for row in df.itertuples():
+        root = Path(row.source_dataset_path)
+        jobs[row.image_path] = root / row.source_relpath
+        if row.source_image_path:
+            jobs[row.source_image_path] = root / row.source_image_relpath
+
+    missing, copied = [], 0
+    def one(item):
+        relative, source = item
+        target = output_dir / relative
+        if target.exists() or target.is_symlink():
+            return None
+        if not source.exists():
+            return relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if mode == "copy":
+            shutil.copy2(source, target)
+        else:
+            target.symlink_to(os.path.relpath(source.resolve(), target.parent))
+        return ""
+
+    total = len(jobs)
+    print(f"{mode}ing {total} image files into {output_dir}/ ...", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for done, result in enumerate(pool.map(one, jobs.items()), 1):
+            if result:
+                missing.append(result)
+            elif result == "":
+                copied += 1
+            if done % 2000 == 0:
+                print(f"  {done}/{total}", flush=True)
+    return copied, missing
+
+
+def class_table(df, index):
+    """crops per <index> x class, counting a multi-label row under each of its classes."""
+    exploded = (
+        df[df["n_classes"] > 0]
+        .assign(cls=lambda d: d["crop_classes"].str.split(","))
+        .explode("cls")
+        .reset_index(drop=True)
+    )
+    if exploded.empty:
+        return "(no labelled rows)"
+    return pd.crosstab(exploded["cls"], exploded[index]).to_string()
+
+
+def readme(df, totals, args, missing):
+    """The provenance document, written from this run's own numbers."""
+    counts = {name: int((df["split"] == name).sum()) for name in SPLIT_FILES}
+    groups = df.groupby("split")["group_id"].nunique()
+    sources = df.groupby("source_dataset")
+
+    lines = [
+        "# FLIP master dataset — original_master_2026_09_04",
+        "",
+        f"Built by `gen_dataset_master.py` on {pd.Timestamp.today():%Y-%m-%d} from three "
+        "existing datasets. Every row records where it came from and how it was placed.",
+        "",
+        f"**{len(df):,} rows** over **{df['group_id'].nunique():,} groups**, split across "
+        f"{len(SPLIT_FILES)} csvs and repeated whole in `dataset.csv`. Every row of every "
+        "source appears exactly once: nothing was dropped.",
+        "",
+        "## where the data came from",
+        "",
+        "| key | source | rows | groups | label level | group is |",
+        "|---|---|---|---|---|---|",
+    ]
+    for name, group in sources:
+        lines.append(
+            f"| `{name}` | `{group['source_dataset_path'].iloc[0]}` | {len(group):,} | "
+            f"{group['group_id'].nunique():,} | {group['label_level'].iloc[0]}-level | "
+            f"the {group['group_level'].iloc[0]} |"
+        )
+    lines += [
+        "",
+        "Per source file, as read:",
+        "",
+        "```",
+    ]
+    for (dataset, source_file), n in totals.items():
+        lines.append(f"  {dataset:<15} {source_file:<24} {n:>6,} rows")
+    lines += [
+        "```",
+        "",
+        "### these sources are not independent",
+        "",
+        "`autocrops` and `historical` are two different crops of the same underlying "
+        "source photographs, and `generalisation` is the crop-level relabelling of "
+        "exactly the imagery `historical/gen_all_df.csv` holds whole. Overlap between "
+        "them is therefore resolved explicitly, not assumed away.",
+        "",
+        "## how the splits were formed",
+        "",
+        "| split | rows | groups | built from |",
+        "|---|---|---|---|",
+        f"| `train` | {counts['train']:,} | {groups.get('train', 0):,} | autocrops train + "
+        "generalisation train + historical train + ~80% of historical hpai |",
+        f"| `val` | {counts['val']:,} | {groups.get('val', 0):,} | autocrops val + "
+        "generalisation val + historical val + ~20% of historical hpai |",
+        f"| `train_overlap` | {counts['train_overlap']:,} | "
+        f"{groups.get('train_overlap', 0):,} | train rows pulled for reaching a test set |",
+        f"| `val_overlap` | {counts['val_overlap']:,} | {groups.get('val_overlap', 0):,} | "
+        "val rows pulled for reaching a test set |",
+        f"| `test_autocrops` | {counts['test_autocrops']:,} | "
+        f"{groups.get('test_autocrops', 0):,} | autocrops `test_df.csv` |",
+        f"| `test_autocrop_gen_vic` | {counts['test_autocrop_gen_vic']:,} | "
+        f"{groups.get('test_autocrop_gen_vic', 0):,} | generalisation "
+        "`relabelled_test_df.csv` — VIC reaches, crop-level labels |",
+        f"| `test_gen_original` | {counts['test_gen_original']:,} | "
+        f"{groups.get('test_gen_original', 0):,} | historical `gen_all_df.csv`, less the "
+        "images whose crops are in generalisation train/val |",
+        f"| `test_gen_original_overlap` | {counts['test_gen_original_overlap']:,} | "
+        f"{groups.get('test_gen_original_overlap', 0):,} | the part of `gen_all_df.csv` "
+        "that lost to generalisation's split |",
+        f"| `test_original` | {counts['test_original']:,} | "
+        f"{groups.get('test_original', 0):,} | historical `test_df.csv` |",
+        "",
+        "### test wins",
+        "",
+        "A train/val row whose `farm_uid` **or** source-image stem appears in any of the "
+        f"four test sets ({', '.join('`' + s + '`' for s in TEST_SPLITS)}) was pulled out "
+        "of train/val. Pulled rows were **not deleted** — they are in "
+        "`train_overlap.csv` and `val_overlap.csv`, with `overlap_reason` saying which "
+        "key matched, and their imagery is copied like any other row. The pull is applied "
+        "to whole groups so a group is never divided between a split and its overlap.",
+        "",
+        "### the gen_all exception",
+        "",
+        "`gen_all_df.csv` is the whole-image view of exactly the imagery the "
+        "`generalisation` dataset relabelled at crop level — every one of "
+        "generalisation's train/val source stems is inside it. A literal test-wins would "
+        "therefore have sent **all** of generalisation's train/val to overlap and left "
+        "the relabelling contributing nothing to training. Instead `gen_all` is divided "
+        "first: the "
+        f"{counts['test_gen_original_overlap']:,} images whose crops are in "
+        "generalisation train/val go to `test_gen_original_overlap.csv`, and the "
+        f"remaining {counts['test_gen_original']:,} form `test_gen_original.csv`. "
+        "Generalisation's training rows survive and `test_gen_original` stays genuinely "
+        "held out. Test-wins applies unmodified everywhere else.",
+        "",
+        "### the two case-study test sets overlap on purpose",
+        "",
+        "`test_gen_original` also contains the source images behind "
+        "`test_autocrop_gen_vic`. Both are test sets, so there is no training leakage, "
+        "and both are kept because they measure different things: whole-image labels from "
+        "the original pipeline against crop-level labels from the relabelling workbooks. "
+        "Affected rows name the other split in `overlap_with`. **Never pool scores across "
+        "the two** — it would count the same imagery twice.",
+        "",
+        "## grouping",
+        "",
+        "Training is multi-label at the level the label was actually assigned, and that "
+        "level is not the same in all three sources. `group_id` is the unit to sample, "
+        "split or aggregate over.",
+        "",
+        "| source | group | rows per group |",
+        "|---|---|---|",
+    ]
+    for name, group in sources:
+        sizes = group.groupby("group_id").size()
+        lines.append(
+            f"| `{name}` | the {group['group_level'].iloc[0]} | "
+            f"mean {sizes.mean():.1f}, max {sizes.max()} |"
+        )
+    lines += [
+        "",
+        "- `group_id` — `<source_dataset>:<farm_uid or source-relative image path>`",
+        "- `group_level` — `farm` (a group spans several images) or `image` (one image)",
+        "- `group_size` — rows in this group",
+        "",
+        "The `<source_dataset>:` prefix matters. `autocrops` and `generalisation` share "
+        "24 `farm_uid`s, and a bare `farm_uid` would silently merge a farm-level group "
+        "with the image-level groups of the same farm across two datasets whose splits "
+        "were assigned independently. **Groups never span datasets.** The raw `farm_uid` "
+        "is still on every row, so merging them later stays a deliberate act.",
+        "",
+        "No `group_id` appears in more than one split — asserted at build time.",
+        "",
+        "`group_level` is about how many images share a label; `label_level` is about "
+        "what the label describes. They differ for `historical`: its groups are single "
+        "images, but each image is a whole farm, so its labels are farm-level.",
+        "",
+        "Group sizes are very uneven — an `autocrops` farm averages several crops while "
+        "the other two sources are one row per group — so sampling by group and sampling "
+        "by row give quite different class balances. That is a training-side decision "
+        "this dataset does not make for you; `group_size` is here so either is available.",
+        "",
+        "## labels",
+        "",
+        f"{len(BINARY)} `binary_<class>` columns, multi-hot: "
+        f"{', '.join('`' + c + '`' for c in CLASSES)}.",
+        "",
+        "Sources disagree on which classes they carry — `autocrops` has 11, "
+        "`generalisation` 13 (it adds `paddock` and `other_industrial`), `historical` 10 "
+        "(no `goats`). A class a source never assessed is written **`False`**. That means "
+        "*not assessed*, not *verified absent*. `binary_paddock` and "
+        "`binary_other_industrial` are only ever `True` on `generalisation` rows, so "
+        "treating their `False` values as negatives will train against the other two "
+        "sources rather than with them.",
+        "",
+        f"`label_status` is `labelled` for {int((df['label_status'] == 'labelled').sum()):,} "
+        "rows. The rest carry a placeholder class from `gen_all_df.csv` and no positive "
+        "label at all:",
+        "",
+        "```",
+    ]
+    for status, n in df.loc[df["label_status"] != "labelled", "label_status"].value_counts().items():
+        lines.append(f"  {status:<16} {n:>6,}")
+    lines += [
+        "```",
+        "",
+        "They are kept so nothing is lost, but filter them out before training or "
+        "scoring.",
+        "",
+        "## columns",
+        "",
+        "**Provenance** (on every file, standalone and combined alike)",
+        "",
+        "- `source_dataset` — `autocrops` | `generalisation` | `historical`",
+        "- `source_dataset_path` — the directory it was read from",
+        "- `source_file` — the csv within it",
+        "- `source_split` — that file's own notion of the split, verbatim",
+        "- `split` — the split in this dataset",
+        "- `label_level` — `farm` or `crop`; what the label describes",
+        "- `label_status` — `labelled`, or the placeholder class for unlabelled rows",
+        "",
+        "**Grouping** — `group_id`, `group_level`, `group_size`",
+        "",
+        "**Overlap**",
+        "",
+        "- `overlap_with` — other splits this row's farm or source image also appears in",
+        "- `overlap_reason` — why a row was pulled to `*_overlap`: `farm_uid`, "
+        "`source_image`, both, or `group` (pulled to keep its group whole)",
+        "",
+        "**Identity and imagery**",
+        "",
+        "- `image_path` — relative to this directory, e.g. "
+        "`autocrops/farm-…/buildings/….tif`",
+        "- `source_relpath` — the same file relative to `source_dataset_path`, so a row "
+        "can always be traced back to the build it came from",
+        "- `source_image_path` / `source_image_relpath` — the source photograph the crop "
+        "was cut from, where the source recorded one",
+        "- `source_image_name` / `source_image_stem` — the photograph's name; the stem "
+        "(lower-cased, extension stripped) is the key all three sources join on",
+        "- `farm_uid` — `autocrops` and `generalisation` only; `historical` has none",
+        "",
+        "**Labels** — `processed_class` (the primary class), `crop_classes` "
+        "(comma-separated, canonical order), `n_classes`, and the 13 `binary_` columns.",
+        "",
+        "Source-specific columns are carried through under their own names and left blank "
+        "where a source did not have them.",
+        "",
+        "## imagery",
+        "",
+        f"Each source's files are under its own subfolder "
+        f"({', '.join('`' + d + '/`' for d in SUBDIR.values())}) at the relative path "
+        "`image_path` names. `autocrops` and `historical` share source photographs; each "
+        f"gets its own copy so no subfolder depends on another. Mode for this build: "
+        f"`{args.imagery}`.",
+        "",
+        "## rows per split x class",
+        "",
+        "A multi-label row counts under each of its classes.",
+        "",
+        "```",
+        class_table(df, "split"),
+        "```",
+        "",
+        "## rows per source x class",
+        "",
+        "```",
+        class_table(df, "source_dataset"),
+        "```",
+        "",
+    ]
+    if missing:
+        lines += [
+            "## warnings",
+            "",
+            f"{len(missing)} image files named in the csvs were not found in their source "
+            f"directory, e.g. `{missing[0]}`.",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--autocrops", type=Path, default=DEFAULT_AUTOCROPS)
+    parser.add_argument("--generalisation", type=Path, default=DEFAULT_GENERALISATION)
+    parser.add_argument("--historical", type=Path, default=DEFAULT_HISTORICAL)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT,
+                        help=f"where the master dataset is written (default: {DEFAULT_OUTPUT})")
+    parser.add_argument("--imagery", choices=["copy", "symlink", "none"], default="copy",
+                        help="copy the imagery into the output (default), symlink it, or "
+                             "write only the csvs")
+    parser.add_argument("--val-fraction", type=float, default=VAL_FRACTION,
+                        help=f"share of the hpai rows given to val (default: {VAL_FRACTION})")
+    parser.add_argument("--random-state", type=int, default=RANDOM_STATE)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="write the csvs and README but no imagery")
+    args = parser.parse_args()
+    if args.dry_run:
+        args.imagery = "none"
+
+    df = pd.concat([
+        load_autocrops(args.autocrops),
+        load_generalisation(args.generalisation),
+        load_historical(args.historical),
+    ], ignore_index=True)
+    totals = df.groupby(["source_dataset", "source_file"], sort=False).size().to_dict()
+    print(f"read {len(df):,} rows from {len(totals)} source files")
+
+    df = assign_splits(df, args.val_fraction, args.random_state)
+    df = apply_test_wins(df)
+    df = annotate(df)
+
+    problems = check(df, totals)
+    if problems:
+        print("\nrefusing to write:", file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+
+    df = df.reindex(columns=COLUMNS)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(args.output_dir / "dataset.csv", index=False)
+    print(f"\n{'split':<28}{'rows':>8}{'groups':>9}")
+    for name, filename in SPLIT_FILES.items():
+        part = df[df["split"] == name]
+        part.to_csv(args.output_dir / filename, index=False)
+        print(f"  {filename:<26}{len(part):>8,}{part['group_id'].nunique():>9,}")
+    print(f"  {'dataset.csv':<26}{len(df):>8,}{df['group_id'].nunique():>9,}")
+
+    copied, missing = copy_imagery(df, args.output_dir, args.imagery)
+    if args.imagery != "none":
+        print(f"{copied:,} image files {args.imagery}ed")
+        if missing:
+            print(f"  warning: {len(missing)} files not found, e.g. {missing[:3]}")
+
+    (args.output_dir / "README.md").write_text(readme(df, totals, args, missing))
+    print(f"\nwrote {args.output_dir}/README.md")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
