@@ -59,6 +59,15 @@ from pathlib import Path
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+# The workbook reader, so an unlabelled generalisation crop can be told apart from one a
+# labeller looked at and marked Ambiguous.
+from gen_dataset_croplevel import (
+    DEFAULT_DROP_LABELS,
+    crop_key,
+    normalise_label,
+    read_crop_labels,
+)
+
 DEFAULT_AUTOCROPS = Path(
     "/home/mannixe/FLIP/flip-geoimage-dataset-builder/original_new_2026_08_21"
 )
@@ -602,11 +611,230 @@ def check(df, totals):
     return problems
 
 
-def copy_imagery(df, output_dir, mode, workers=8):
+# Everything under the three source roots that no split points at. It is copied in
+# alongside the dataset and catalogued in unmatched_to_labels.csv, with the reason it sits
+# outside the labelled set, so the leftovers are inspectable rather than merely absent.
+IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+UNMATCHED_NAME = "unmatched_to_labels.csv"
+UNMATCHED_COLUMNS = [
+    "source_dataset", "source_dataset_path", "source_relpath", "image_path", "copied",
+    "file_bytes", "exclusion_class", "exclusion_reason", "farm_uid", "ecw_stem",
+    "source_image_name", "build_class",
+]
+
+
+def image_files(root):
+    """Every image file under root, as (relpath, size in bytes)."""
+    for dirpath, _, names in os.walk(root):
+        for name in names:
+            if os.path.splitext(name)[1].lower() not in IMAGE_SUFFIXES:
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                yield os.path.relpath(full, root), os.path.getsize(full)
+            except OSError:
+                continue
+
+
+def blank(**overrides):
+    record = {key: "" for key in UNMATCHED_COLUMNS}
+    record.update(overrides)
+    return record
+
+
+def autocrops_reasons(root):
+    """Why a file under the autocrops build is in no split.
+
+    The build tags its own excluded rows, so the reason can be read straight off it:
+    those crops' source photographs are named in farmfinder_train_2022.xlsx.
+    """
+    build = pd.read_csv(root / "dataset.csv", dtype={"building_cluster": str, "PFI": str},
+                        low_memory=False)
+    reasons = {}
+    for row in build.itertuples():
+        meta = blank(farm_uid=row.farm_uid, ecw_stem=row.ecw_stem,
+                     source_image_name=row.filename, build_class=row.processed_class)
+        if row.split == "excluded":
+            meta.update(
+                exclusion_class="excluded_upstream",
+                exclusion_reason="the build tagged it split=excluded — its source "
+                                 "photograph is listed in farmfinder_train_2022.xlsx "
+                                 "(the train_exceptions hold-out list)",
+            )
+        else:
+            meta.update(
+                exclusion_class="not_in_split",
+                exclusion_reason=f"in the build under split={row.split} but not carried "
+                                 "into this dataset",
+            )
+        reasons[row.image_path] = meta
+        source = str(row.source_image_path or "")
+        if source and source not in reasons:
+            reasons[source] = dict(meta, exclusion_class="source_photograph",
+                                   exclusion_reason="the source photograph a crop was cut "
+                                                    "from; no crop of it reached a split")
+    return reasons, crop_fallback(set(build["farm_uid"].astype(str)))
+
+
+def crop_fallback(built_farms):
+    """Why a crop is on disk but in none of a builder's csvs.
+
+    The builder writes every crop it cuts, then measures each one and drops the ones
+    holding no usable imagery — `blank_reason` is empty for every surviving row, so the
+    dropped ones are simply absent. Sampling confirms it: these files have a pixel
+    standard deviation around zero against a minimum of 16.7 for crops the build kept.
+    """
+    def fallback(relative):
+        farm = str(relative).split(os.sep)[0]
+        if farm in built_farms:
+            return blank(
+                farm_uid=farm, exclusion_class="blank_or_nodata",
+                exclusion_reason="written by the build, then dropped by its blank/nodata "
+                                 "crop-quality test — the crop holds no usable imagery "
+                                 "(near-zero pixel variance)",
+            )
+        return blank(
+            farm_uid=farm, exclusion_class="farm_not_built",
+            exclusion_reason="its farm appears in no row of the build — every label of "
+                             "the farm is a drop class (mixed / small), or the farm was "
+                             "never built",
+        )
+    return fallback
+
+
+def generalisation_reasons(root, labelled_dir):
+    """Why a crop of the generalisation build is not in the relabelled dataset.
+
+    Two quite different reasons, and the distinction matters: a crop nobody has labelled
+    yet returns as soon as its reach is worked through, while an Ambiguous one was looked
+    at and could not be called. The workbooks are read directly so the two are separated
+    rather than lumped together as "unlabelled".
+    """
+    build = pd.read_csv(root / "dataset.csv", dtype={"building_cluster": str, "PFI": str},
+                        low_memory=False)
+    labels = {}
+    if labelled_dir and Path(labelled_dir).is_dir():
+        labels, _ = read_crop_labels(Path(labelled_dir))
+    reasons = {}
+    for row in build.itertuples():
+        found = labels.get(crop_key(row.farm_uid, row.image_path))
+        label = found["crop_label"] if found else ""
+        meta = blank(farm_uid=row.farm_uid, ecw_stem=row.ecw_stem,
+                     source_image_name=row.filename, build_class=label)
+        if not found:
+            meta.update(
+                exclusion_class="unlabelled",
+                exclusion_reason="no workbook label — its reach has not been relabelled "
+                                 "yet, so there is nothing to train on",
+            )
+        elif normalise_label(label) in {normalise_label(l) for l in DEFAULT_DROP_LABELS}:
+            meta.update(
+                exclusion_class="ambiguous",
+                exclusion_reason=f"labelled {label!r} in {found['label_workbook']} — the "
+                                 "labeller could not call it, so it is dropped",
+            )
+        else:
+            meta.update(
+                exclusion_class="unresolved",
+                exclusion_reason=f"labelled {label!r} in {found['label_workbook']} but "
+                                 "resolved to no class",
+            )
+        reasons[row.image_path] = meta
+        source = str(row.source_image_path or "")
+        if source and source not in reasons:
+            reasons[source] = dict(meta, exclusion_class="source_photograph",
+                                   exclusion_reason="the source photograph a crop was cut "
+                                                    "from; no crop of it reached a split")
+    return reasons, crop_fallback(set(build["farm_uid"].astype(str)))
+
+
+def historical_reasons(root):
+    """Why an image of the historical pipeline is in no split.
+
+    df.csv lists every image the pipeline knows about, and the five split csvs list what
+    it kept, so anything in the first and not the second is a train_exceptions hold-out.
+    """
+    full = pd.read_csv(root / "df.csv", low_memory=False)
+    reasons = {}
+    for row in full.itertuples():
+        reasons[str(row.image_files_out_rel)] = blank(
+            source_image_name=row.image_name, build_class=row.image_classes,
+            exclusion_class="excluded_upstream",
+            exclusion_reason="listed in farmfinder_train_2022.xlsx (the train_exceptions "
+                             "hold-out list), so the pipeline wrote it to no split",
+        )
+    return reasons, lambda relative: blank(
+        exclusion_class="not_in_build",
+        exclusion_reason="present on disk but named in none of the pipeline's csvs",
+    )
+
+
+def visual_duplicates(root):
+    """Names and sizes of the images `visual/` holds a second copy of.
+
+    historical_processing.py copies every split image into per-class folders under
+    visual/ for eyeballing. Those are byte-for-byte the same pictures already in the
+    dataset, so they are catalogued but never copied — matched on name and size rather
+    than assumed, so a file that only looks like a duplicate is still reported as one.
+    """
+    elsewhere = {}
+    for relative, size in image_files(root):
+        if relative.split(os.sep)[0] != "visual":
+            elsewhere.setdefault((os.path.basename(relative), size), relative)
+    return elsewhere
+
+
+def unmatched_inventory(df, args):
+    """Every image under the source roots that no row of the dataset points at."""
+    sources = [
+        ("historical", args.historical, lambda r: historical_reasons(r)),
+        ("autocrops", args.autocrops, lambda r: autocrops_reasons(r)),
+        ("generalisation", args.generalisation,
+         lambda r: generalisation_reasons(r, args.labelled)),
+    ]
+    records = []
+    for name, root, reasons_for in sources:
+        part = df[df["source_dataset"] == name]
+        referenced = set(part["source_relpath"].astype(str)) | {
+            p for p in part["source_image_relpath"].fillna("").astype(str) if p
+        }
+        reasons, fallback = reasons_for(root)
+        duplicates = visual_duplicates(root) if name == "historical" else {}
+        for relative, size in image_files(root):
+            if relative in referenced:
+                continue
+            record = dict(reasons.get(relative) or fallback(relative))
+            original = duplicates.get((os.path.basename(relative), size))
+            if relative.split(os.sep)[0] == "visual" and original:
+                record.update(
+                    exclusion_class="duplicate_visual",
+                    exclusion_reason=f"a second copy, for eyeballing, of {original}",
+                )
+            if size == 0:
+                record.update(
+                    exclusion_class="zero_bytes",
+                    exclusion_reason="the file is empty",
+                )
+            copied = record["exclusion_class"] not in {"duplicate_visual", "zero_bytes"}
+            record.update(
+                source_dataset=name, source_dataset_path=str(root),
+                source_relpath=relative, file_bytes=size, copied=copied,
+                image_path=f"{SUBDIR[name]}/{relative}" if copied else "",
+            )
+            records.append(record)
+    inventory = pd.DataFrame(records, columns=UNMATCHED_COLUMNS)
+    return inventory.sort_values(
+        ["source_dataset", "exclusion_class", "source_relpath"]
+    ).reset_index(drop=True)
+
+
+def copy_imagery(df, output_dir, mode, extra, workers=8):
     """Put every row's imagery under output_dir at the path image_path already names.
 
     Each source keeps its own subfolder, so the two that share source photographs each get
-    their own copy and neither subfolder depends on the other.
+    their own copy and neither subfolder depends on the other. `extra` carries the images
+    no split points at: they are copied too, so the directory holds every valid picture
+    the three builds produced, and unmatched_to_labels.csv says why each is unlabelled.
     """
     if mode == "none":
         return 0, []
@@ -616,6 +844,9 @@ def copy_imagery(df, output_dir, mode, workers=8):
         jobs[row.image_path] = root / row.source_relpath
         if row.source_image_path:
             jobs[row.source_image_path] = root / row.source_image_relpath
+    for row in extra.itertuples():
+        if row.copied:
+            jobs[row.image_path] = Path(row.source_dataset_path) / row.source_relpath
 
     missing, copied = [], 0
     def one(item):
@@ -658,7 +889,7 @@ def class_table(df, index):
     return pd.crosstab(exploded["cls"], exploded[index]).to_string()
 
 
-def readme(df, totals, args, missing):
+def readme(df, totals, args, missing, unmatched):
     """The provenance document, written from this run's own numbers."""
     counts = {name: int((df["split"] == name).sum()) for name in SPLIT_FILES}
     groups = df.groupby("split")["group_id"].nunique()
@@ -918,6 +1149,51 @@ def readme(df, totals, args, missing):
         "Source-specific columns are carried through under their own names and left blank "
         "where a source did not have them.",
         "",
+        "## what is not in the labelled set",
+        "",
+        f"`{UNMATCHED_NAME}` catalogues every image under the three source roots that no "
+        f"row of this dataset points at — {len(unmatched):,} files — and says why each one "
+        "sits outside the labelled set. Most are copied in anyway, so this directory "
+        "holds every usable picture the three builds produced and the csv is the index to "
+        "the unlabelled remainder.",
+        "",
+        "| reason | files | copied | size | what it is |",
+        "|---|---|---|---|---|",
+    ]
+    explain = {
+        "unlabelled": "generalisation crops whose reach has not been relabelled yet — "
+                      "the largest pool of work still to do",
+        "ambiguous": "generalisation crops a labeller looked at and could not call",
+        "excluded_upstream": "named in `farmfinder_train_2022.xlsx`, the 2022 "
+                             "train_exceptions hold-out, so the builds put them in no split",
+        "blank_or_nodata": "cut by the builder, then dropped by its own crop-quality "
+                           "test: near-zero pixel variance, no usable imagery",
+        "farm_not_built": "their farm is in no build row — a drop class (mixed / small), "
+                          "or never built",
+        "source_photograph": "whole photographs whose crops all fell out somewhere above",
+        "duplicate_visual": "**not copied** — `historical/visual/` is a second copy, for "
+                            "eyeballing, of images already in this dataset",
+        "zero_bytes": "**not copied** — empty files",
+        "not_in_build": "on disk but named in none of the pipeline's csvs",
+    }
+    for reason, part in unmatched.groupby("exclusion_class"):
+        lines.append(
+            f"| `{reason}` | {len(part):,} | {int(part['copied'].sum()):,} | "
+            f"{part['file_bytes'].sum() / 2**30:.1f} GB | {explain.get(reason, '')} |"
+        )
+    lines += [
+        "",
+        "Columns: `source_dataset`, `source_relpath`, `image_path` (where it landed, "
+        "blank if not copied), `copied`, `file_bytes`, `exclusion_class`, "
+        "`exclusion_reason`, and `farm_uid` / `ecw_stem` / `source_image_name` / "
+        "`build_class` wherever the build knew them — enough to label a batch of these "
+        "later and join the result straight back on.",
+        "",
+        "The two categories that are **not** copied are the ones that would add nothing: "
+        "`historical/visual/` holds a byte-for-byte second copy of pictures already here "
+        "(matched on name and size, not assumed), and empty files have no content to "
+        "carry. Everything else is copied.",
+        "",
         "## imagery",
         "",
         f"Each source's files are under its own subfolder "
@@ -958,6 +1234,9 @@ def main():
     parser.add_argument("--autocrops", type=Path, default=DEFAULT_AUTOCROPS)
     parser.add_argument("--generalisation", type=Path, default=DEFAULT_GENERALISATION)
     parser.add_argument("--historical", type=Path, default=DEFAULT_HISTORICAL)
+    parser.add_argument("--labelled", type=Path, default=Path("labelled_sheets"),
+                        help="the labelling workbooks, read only to say why an unmatched "
+                             "generalisation crop is unlabelled (default: labelled_sheets)")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT,
                         help=f"where the master dataset is written (default: {DEFAULT_OUTPUT})")
     parser.add_argument("--imagery", choices=["copy", "symlink", "none"], default="copy",
@@ -1001,13 +1280,24 @@ def main():
         print(f"  {filename:<26}{len(part):>8,}{part['group_id'].nunique():>9,}")
     print(f"  {'dataset.csv':<26}{len(df):>8,}{df['group_id'].nunique():>9,}")
 
-    copied, missing = copy_imagery(df, args.output_dir, args.imagery)
+    unmatched = unmatched_inventory(df, args)
+    unmatched.to_csv(args.output_dir / UNMATCHED_NAME, index=False)
+    print(f"\n{len(unmatched):,} images under the source roots are in no split "
+          f"-> {UNMATCHED_NAME}")
+    for reason, part in unmatched.groupby("exclusion_class"):
+        kept = int(part["copied"].sum())
+        print(f"  {reason:<20}{len(part):>7,}  ({kept:,} copied, "
+              f"{part['file_bytes'].sum() / 2**30:.1f} GB)")
+
+    copied, missing = copy_imagery(df, args.output_dir, args.imagery, unmatched)
     if args.imagery != "none":
-        print(f"{copied:,} image files {args.imagery}ed")
+        verb = {"copy": "copied", "symlink": "symlinked"}[args.imagery]
+        print(f"\n{copied:,} image files {verb}")
         if missing:
             print(f"  warning: {len(missing)} files not found, e.g. {missing[:3]}")
 
-    (args.output_dir / "README.md").write_text(readme(df, totals, args, missing))
+    (args.output_dir / "README.md").write_text(
+        readme(df, totals, args, missing, unmatched))
     print(f"\nwrote {args.output_dir}/README.md")
     return 0
 
