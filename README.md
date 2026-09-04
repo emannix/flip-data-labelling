@@ -149,13 +149,13 @@ What they write, and how big each one is:
 
 # building the crop-level dataset
 
-`gen_croplevel_dataset.py` turns the completed workbooks in `labelled_sheets/` back into
+`gen_dataset_croplevel.py` turns the completed workbooks in `labelled_sheets/` back into
 a dataset the models can train on. The builder's `dataset.csv` labels every crop with its
 *farm's* `Farm_type`, which is wrong for most of them — a farm's ten crops are usually
 one shed and nine paddocks — so this reads the per-crop `Label` from each workbook's
 "Image labels" sheet and writes `dataset_relabelled.csv` keyed on that instead.
 
-    python gen_croplevel_dataset.py
+    python gen_dataset_croplevel.py
 
 Defaults to the same `original_new_2026_08_21_generalisation/dataset.csv` as
 `make_spreadsheet.py`, and writes into that same directory — beside the build's own

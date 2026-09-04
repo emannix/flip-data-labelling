@@ -3,7 +3,7 @@
 This is the successor to `gen_evaluation.py`, and it differs from it in three ways that
 are worth stating up front, because they change what the numbers mean.
 
-*Ground truth comes from the dataset, not the workbooks.* `gen_croplevel_dataset.py` has
+*Ground truth comes from the dataset, not the workbooks.* `gen_dataset_croplevel.py` has
 already folded the relabelling workbooks back into
 `original_new_2026_08_21_generalisation/relabelled_*.csv`, so the truth is the `binary_*`
 columns sitting next to the predictions rather than an Excel join done here. The 17
@@ -1867,7 +1867,7 @@ def build_page(
   <h2>How this was scored</h2>
   <div class="notes">
     <p><strong>Ground truth.</strong> The <code>binary_*</code> columns of
-    <code>relabelled_test_df.csv</code>, which <code>gen_croplevel_dataset.py</code> built from
+    <code>relabelled_test_df.csv</code>, which <code>gen_dataset_croplevel.py</code> built from
     the workbooks in <code>labelled_sheets/</code>. {escape(n_crops)} crops over
     {escape(n_farms)} farms; <code>Ambiguous</code> crops were already dropped at build time,
     and the 17 genuinely multi-label crops carry both their classes.</p>
