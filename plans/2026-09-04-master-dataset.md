@@ -40,7 +40,7 @@ marked with a flag.
    `test_gen_original_overlap.csv`, and the remaining 777 form `test_gen_original.csv`.
    (2)'s 483 train/val rows are then kept, and `test_gen_original` is genuinely held out.
    Test-wins applies unmodified everywhere else.
-4. **The 242 `gen_all` images behind `test_gen_vic` stay in `test_gen_original`.** Both
+4. **The 242 `gen_all` images behind `test_autocrop_gen_vic` stay in `test_gen_original`.** Both
    are test sets, so there is no train leakage; they measure different things (whole-image
    old labels vs crop-level new labels). Each such row is flagged with the other test file
    it appears in. **Never pool scores across the two.**
@@ -51,6 +51,45 @@ marked with a flag.
    plainly that `False` here means "the source never assessed this class", not a
    verified negative.
 7. **Imagery is really copied**, not symlinked — ~38 GB, against 1.3 TB free.
+8. **Every row carries a `group_id`** naming the unit the label is asserted over, so a
+   multi-label model can train on groups rather than loose images. See below.
+
+## grouping
+
+Training is multi-label at the level the label was actually assigned, which is not the
+same level in all three sources:
+
+| source | group | groups | rows | rows/group |
+|---|---|---|---|---|
+| `autocrops` (1) | **the farm** — one farm-level label shared by all its crops | 2,429 | 20,803 | 8.6 (max 37) |
+| `generalisation` (2) | **the image** — each crop was labelled on its own | 1,629 | 1,629 | 1 |
+| `historical` (3) | **the image** — the image is the whole farm | 3,536 | 3,536 | 1 |
+
+7,594 groups over 25,968 rows.
+
+- `group_id` — `<source_dataset>:<key>`, where the key is the `farm_uid` for (1) and the
+  source-relative image path for (2) and (3).
+- `group_level` — `farm` (a group spans several images) | `image` (a group is one image).
+- `group_size` — number of rows in the group, so a loader can weight or batch by it.
+
+The `<source_dataset>:` prefix is load-bearing, not decoration: (1) and (2) share 24
+`farm_uid`s, and a bare `farm_uid` would silently merge a farm-level group with the
+image-level groups of the same farm across two datasets that were split independently.
+Groups therefore **never span datasets**. The raw `farm_uid` stays on every row, so
+merging them later remains possible as a deliberate act.
+
+Two properties worth stating, both verified against the source files and both asserted at
+build time:
+
+- **No group straddles a split.** (1)'s own splits are farm-grouped already, and (2)/(3)
+  are one row per group, so this holds by construction.
+- **The overlap pull cannot split a group.** Every one of (1)'s 2,429 farms maps to
+  exactly one source-image stem, so a stem-based pull always takes the whole farm.
+  This is why the row counts below are unaffected by making the pull group-aware.
+
+`group_level` is about how many images share a label; `label_level` is about what the
+label describes. They differ for (3): its groups are single images (`group_level: image`)
+but each image is a whole farm, so its label is farm-level (`label_level: farm`).
 
 ## output layout
 
@@ -63,7 +102,7 @@ original_master_2026_09_04/
 ├── train_overlap.csv                118  pulled from train: hits a test file
 ├── val_overlap.csv                   32  pulled from val: hits a test file
 ├── test_autocrops.csv             1,361  (1) test_df
-├── test_gen_vic.csv               1,146  (2) relabelled_test_df — VIC, crop-level labels
+├── test_autocrop_gen_vic.csv      1,146  (2) relabelled_test_df — VIC, crop-level labels
 ├── test_gen_original.csv            777  (3) gen_all minus (2)'s train/val imagery
 ├── test_gen_original_overlap.csv    151  the part of gen_all whose crops are in training
 ├── test_original.csv                136  (3) test_df
@@ -83,10 +122,16 @@ Provenance columns, on every file including the standalone ones (requirement 1):
 - `source_dataset_path` — absolute path of the directory it was read from
 - `source_file` — the CSV within it (`train_df.csv`, `relabelled_test_df.csv`, `hpai_df.csv`, `gen_all_df.csv`, …)
 - `source_split` — that file's own notion of the split, verbatim
-- `split` — the new split: `train`, `val`, `train_overlap`, `val_overlap`, `test_autocrops`, `test_gen_vic`, `test_gen_original`, `test_gen_original_overlap`, `test_original`
+- `split` — the new split: `train`, `val`, `train_overlap`, `val_overlap`, `test_autocrops`, `test_autocrop_gen_vic`, `test_gen_original`, `test_gen_original_overlap`, `test_original`
 - `label_level` — `farm` for (1) and (3), `crop` for (2)
 - `overlap_with` — comma-separated names of the other splits this row's farm or source image also appears in; `""` when it is unique
 - `overlap_reason` — `farm_uid` | `source_image` | `farm_uid,source_image` | `""`
+
+Grouping (see the section above):
+
+- `group_id` — `<source_dataset>:<farm_uid or source-relative image path>`
+- `group_level` — `farm` | `image`
+- `group_size` — rows in this group
 
 Identity and imagery:
 
@@ -111,19 +156,23 @@ Source-specific columns are carried through where present and blank elsewhere:
 
 ## build order
 
-1. Read the ten source CSVs; normalise each to the unified schema, stamping provenance.
+1. Read the ten source CSVs; normalise each to the unified schema, stamping provenance
+   and assigning `group_id` / `group_level` / `group_size`.
 2. Split `gen_all` on (2)'s train/val stems → `test_gen_original` + its overlap file.
 3. Stratify `hpai` 80/20 into train/val.
 4. Build the test pool (stems ∪ farm_uids over the four test files) and pull matching
-   train/val rows into `train_overlap` / `val_overlap`, recording `overlap_reason`.
+   train/val rows into `train_overlap` / `val_overlap`, recording `overlap_reason`. The
+   pull is applied to whole groups; the assertion in step 6 checks it never had to split
+   one.
 5. Compute `overlap_with` across all final splits (including test↔test, for decision 4).
 6. Assert: every input row appears exactly once in the output; no row is in two splits;
-   no farm straddles train/val and a test file.
+   no `group_id` appears in two splits; no farm straddles train/val and a test file;
+   `group_size` matches the realised group counts.
 7. Copy imagery into the three subfolders at each row's relative path, rewriting
    `image_path`/`source_image_path` to the master-relative form.
 8. Write the CSVs, then generate `README.md` from the run's own numbers — per-source
-   provenance, the combination rules above, per-split × class tables, and the overlap
-   ledger.
+   provenance, the combination rules above, per-split × class tables, group counts per
+   split, and the overlap ledger.
 
 ## CLI
 
@@ -143,3 +192,8 @@ python gen_dataset_master.py [--output-dir original_master_2026_09_04]
 - Mixing farm-level labels ((1), (3)) with crop-level labels ((2)) in one training set
   is the known compromise — `label_level` makes it filterable, and the README says so.
 - `binary_paddock` / `binary_other_industrial` are only ever true for (2) rows.
+- Groups are very uneven — 8.6 rows for an autocrops farm against 1 for the other two
+  sources — so a group-sampled loader draws 2,429 farm groups against 5,165 single-image
+  groups while the row counts run 20,803 against 5,165. Whether to sample by group or by
+  row, and whether to weight, is a training-side decision this dataset does not make;
+  `group_size` is there so either is available.
