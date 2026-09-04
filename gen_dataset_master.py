@@ -115,6 +115,23 @@ SOURCE_ORDER = ["historical", "autocrops", "generalisation"]
 THIS_REPO = "https://github.com/emannix/flip-data-labelling"
 THIS_REPO_NAME = "emannix/flip-data-labelling"
 
+# Why the three sources cannot be treated as independent samples. Shared by the generated
+# README and the summary dashboard, so the two never drift apart.
+NOT_INDEPENDENT = (
+    "`autocrops` and `historical` are two different crops of the same underlying source "
+    "photographs, and `generalisation` is the crop-level relabelling of exactly the "
+    "imagery `historical/gen_all_df.csv` holds whole. Overlap between them is therefore "
+    "resolved explicitly, not assumed away.\n\n"
+    "Two consequences worth holding onto:\n\n"
+    "- **`test_autocrops` and `test_original` are the same hold-out.** Both are defined "
+    "by `farmfinder_test_2022.xlsx` — one at crop level, one at whole-image level. They "
+    "share 125 source photographs. Treat them as two views of one test set, not as two "
+    "independent ones.\n"
+    "- **`autocrops` and `generalisation` overlap by farm** (24 `farm_uid`s), even "
+    "though they never share a crop file. That is why the test-wins rule below checks "
+    "`farm_uid` as well as the source photograph."
+)
+
 # Where each source is built and how its own splits were decided. Written into the
 # generated README, because the three were split on three different principles and a
 # reader who assumes one rule for all of them will misread the test numbers.
@@ -641,20 +658,7 @@ def readme(df, totals, args, missing):
     lines += [
         "### these sources are not independent",
         "",
-        "`autocrops` and `historical` are two different crops of the same underlying "
-        "source photographs, and `generalisation` is the crop-level relabelling of "
-        "exactly the imagery `historical/gen_all_df.csv` holds whole. Overlap between "
-        "them is therefore resolved explicitly, not assumed away.",
-        "",
-        "Two consequences worth holding onto:",
-        "",
-        "- **`test_autocrops` and `test_original` are the same hold-out.** Both are "
-        "defined by `farmfinder_test_2022.xlsx` — one at crop level, one at whole-image "
-        "level. They share 125 source photographs. Treat them as two views of one test "
-        "set, not as two independent ones.",
-        "- **`autocrops` and `generalisation` overlap by farm** (24 `farm_uid`s), even "
-        "though they never share a crop file. That is why the test-wins rule below "
-        "checks `farm_uid` as well as the source photograph.",
+        NOT_INDEPENDENT,
         "",
         "## how the splits were formed",
         "",

@@ -32,9 +32,19 @@ from __future__ import annotations
 
 import argparse
 import html
+import re
 from pathlib import Path
 
 import pandas as pd
+
+# The provenance prose lives in gen_dataset_master.py, beside the code that acts on it,
+# so the dashboard and the dataset's own README cannot drift apart.
+from gen_dataset_master import (
+    NOT_INDEPENDENT,
+    SOURCE_NOTES,
+    THIS_REPO,
+    THIS_REPO_NAME,
+)
 
 DEFAULT_DATASET = Path("original_master_2026_09_04/dataset.csv")
 
@@ -58,9 +68,9 @@ ROLE_OF = dict(SPLITS)
 # Categorical slots 1-3 from the reference palette, light value first. This prefix is
 # the documented all-pairs-safe one; a fourth source would need folding or faceting.
 SOURCES = {
+    "historical": ("#1baf7a", "#199e70"),
     "autocrops": ("#2a78d6", "#3987e5"),
     "generalisation": ("#eb6834", "#d95926"),
-    "historical": ("#1baf7a", "#199e70"),
 }
 SOURCE_ORDER = list(SOURCES)
 
@@ -122,7 +132,12 @@ def rounded_right(x: float, y: float, width: float, height: float, radius: float
 
 
 def nice_ticks(top: float, count: int = 4) -> list[float]:
-    """Round tick values up to and including a sensible ceiling for `top`."""
+    """Tick values from 0 to a round ceiling that is always >= `top`.
+
+    The ceiling has to clear the data, not stop just short of it: the bars are scaled by
+    the last tick, so a ceiling below the maximum silently pushes the widest rows — and
+    their labels — off the right-hand edge of the viewBox.
+    """
     if top <= 0:
         return [0]
     raw = top / count
@@ -131,10 +146,40 @@ def nice_ticks(top: float, count: int = 4) -> list[float]:
         (m * magnitude for m in (1, 2, 2.5, 5, 10) if m * magnitude >= raw), raw
     )
     ticks, value = [], 0.0
-    while value <= top + step * 0.001:
+    while value < top:
         ticks.append(value)
         value += step
+    ticks.append(value)
     return ticks
+
+
+def inline_md(source: str) -> str:
+    """The inline markdown the provenance notes use: links, bold, code, emphasis.
+
+    Escaping runs first and introduces none of the marker characters, so the patterns
+    below cannot match anything the escaping produced.
+    """
+    out = escape(source)
+    out = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', out)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", out)
+    out = re.sub(r"`([^`]+)`", r"<code>\1</code>", out)
+    out = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", out)
+    return out
+
+
+def block_md(source: str) -> str:
+    """Blank-line-separated paragraphs and `- ` bullet lists. No other block forms."""
+    blocks = []
+    for block in source.split("\n\n"):
+        lines = [line for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        if all(line.startswith("- ") for line in lines):
+            items = "".join(f"<li>{inline_md(line[2:])}</li>" for line in lines)
+            blocks.append(f"<ul>{items}</ul>")
+        else:
+            blocks.append(f"<p>{inline_md(' '.join(lines))}</p>")
+    return "".join(blocks)
 
 
 def heat_index(fraction: float) -> int:
@@ -221,6 +266,7 @@ def stacked_bars(table: pd.DataFrame, unit: str, note: str = "") -> str:
         y = top + index * (row_h + gap)
         total = int(table.loc[split].sum())
         parts.append(text(label_w - 12, y + row_h / 2 + 4, split, "rowlabel", "end"))
+        segments = int((table.loc[split] > 0).sum())
         cursor = 0.0
         for source in SOURCE_ORDER:
             value = int(table.loc[split, source])
@@ -240,7 +286,7 @@ def stacked_bars(table: pd.DataFrame, unit: str, note: str = "") -> str:
                 f'<g class="mark" fill="var(--src-{source})">{tip(f"{split} · {source}: {value:,} {unit}")}'
                 f"{shape}</g>"
             )
-            if drawn > 46:
+            if drawn > 46 and segments > 1:
                 parts.append(text(
                     label_w + cursor + drawn / 2, y + row_h / 2 + 4,
                     f"{value:,}", "inbar", "middle",
@@ -534,6 +580,44 @@ def multilabel_table(df: pd.DataFrame) -> str:
     )
 
 
+def provenance_cards(df: pd.DataFrame) -> str:
+    """One card per source: where it is built, what a row is, and how it was split.
+
+    The three were split on three different principles — a curated 2022 hold-out for two
+    of them, a geographic hold-out for the third — so a reader who assumes one rule for
+    all three will misread the test numbers. That is why this sits on the page at all.
+    """
+    cards = []
+    for number, name in enumerate(SOURCE_ORDER, 1):
+        note = SOURCE_NOTES[name]
+        part = df[df["source_dataset"] == name]
+        landed = part.groupby("split").size().reindex(SPLIT_ORDER).dropna()
+        rows = "".join(
+            f'<tr><th scope="row">{escape(split)}</th><td>{int(n):,}</td></tr>'
+            for split, n in landed.items()
+        )
+        cards.append(f"""
+<div class="card prov-card">
+  <div class="card-head">
+    <h3><span class="swatch swatch-{name}"></span>{number}. <code>{escape(name)}</code></h3>
+    <p class="repo"><a href="{escape(note['repo'])}">{escape(note['repo_name'])}</a>
+    &middot; built by {inline_md(note['built_by'])}</p>
+  </div>
+  <div class="prose">
+    <p class="prose-label">What a row is</p>
+    {block_md(note['rows'])}
+    <p class="prose-label">How it was split, upstream</p>
+    {block_md(note['split'])}
+  </div>
+  <details>
+    <summary>Where its {len(part):,} rows landed in this dataset</summary>
+    <table class="data mini-split"><tbody>{rows}</tbody></table>
+  </details>
+</div>
+""")
+    return "".join(cards)
+
+
 def tiles(df: pd.DataFrame) -> str:
     training = df[df["split"].isin(["train", "val"])]
     tests = df[df["split"].str.startswith("test_") & ~df["split"].str.endswith("_overlap")]
@@ -727,6 +811,23 @@ table { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size
 .ramp { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); }
 .ramp i { width: 22px; height: 10px; border-radius: 2px; display: inline-block; }
 
+.prov-card .card-head { align-items: baseline; gap: 6px 16px; }
+.prov-card h3 { display: flex; align-items: center; }
+.repo { margin: 0; font-size: 12.5px; color: var(--muted); margin-left: auto; }
+.prose { display: flex; flex-direction: column; gap: 10px; max-width: 82ch; }
+.prose p { margin: 0; color: var(--ink-2); font-size: 13.5px; }
+.prose strong { color: var(--ink); font-weight: 600; }
+.prose ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }
+.prose li { color: var(--ink-2); font-size: 13.5px; }
+.prose-label {
+  font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted) !important; margin-top: 4px !important;
+}
+details { font-size: 13px; color: var(--ink-2); }
+summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+.mini-split { width: auto; margin-top: 8px; }
+.mini-split th { padding-left: 0; }
+
 .notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px 32px; }
 .notes p { margin: 0; color: var(--ink-2); font-size: 13.5px; }
 .notes strong { color: var(--ink); font-weight: 600; }
@@ -752,10 +853,26 @@ def build(dataset: Path) -> str:
   <p class="standfirst">Three source datasets combined into one training corpus and four
   test sets. The dataset counts three different things &mdash; images, label groups and
   farms &mdash; and they do not move together, so every breakdown below is given by more
-  than one of them. Built from <code>{escape(dataset)}</code>.</p>
+  than one of them. Built from <code>{escape(dataset)}</code> by
+  <a href="{THIS_REPO}">{THIS_REPO_NAME}</a>.</p>
 </header>
 """,
         f'<div class="tiles">{tiles(df)}</div>',
+        f"""
+<section>
+  <h2>Where the data came from</h2>
+  <p class="lede">Three datasets, introduced in the order they were derived: the original
+  pipeline first, then the two builds cut from its imagery. They were each split on a
+  <strong>different principle</strong> &mdash; a curated 2022 FarmFinder hold-out for the
+  first two, a geographic NSW/VIC hold-out for the third &mdash; so read each one's rule
+  before comparing their test numbers.</p>
+  {provenance_cards(df)}
+  <div class="card">
+    <div class="card-head"><h3>These sources are not independent</h3></div>
+    <div class="prose">{block_md(NOT_INDEPENDENT)}</div>
+  </div>
+</section>
+""",
         f"""
 <section>
   <h2>The three units</h2>
