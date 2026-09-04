@@ -1,11 +1,11 @@
 """Combine the three FLIP datasets into one master corpus with four named test sets.
 
-    1  autocrops       flip-geoimage-dataset-builder/original_new_2026_08_21
-                       building crops cut from ECW aerial imagery, farm-level labels
-    2  generalisation  flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation
-                       the same kind of crops, but crop-level labels from the workbooks
-    3  historical      flip-dataset-processing/output/flip_historical
-                       whole-farm images from the original pipeline
+    1  historical      flip-dataset-processing/output/flip_historical
+                       whole-farm photographs from the original FLIP pipeline
+    2  autocrops       flip-geoimage-dataset-builder/original_new_2026_08_21
+                       building crops cut from those same photographs, farm-level labels
+    3  generalisation  flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation
+                       the case-study subset of those crops, relabelled crop by crop
 
 These are not three independent collections. (1) and (3) are two different crops of the
 same underlying source photographs — 2,398 source-image names in common — and (2) is the
@@ -104,6 +104,119 @@ OVERLAP_OF = {"train": "train_overlap", "val": "val_overlap"}
 
 VAL_FRACTION = 0.20
 RANDOM_STATE = 42
+
+# The order the three sources are introduced in: the original pipeline first, then the
+# two builds derived from its imagery, so each one can be explained in terms of the last.
+SOURCE_ORDER = ["historical", "autocrops", "generalisation"]
+
+# This repository — the one that builds the dataset the README ships inside. Named at
+# the top of the generated README so someone who receives only the dataset directory can
+# find the code that produced it and the workbooks the crop-level labels came from.
+THIS_REPO = "https://github.com/emannix/flip-data-labelling"
+THIS_REPO_NAME = "emannix/flip-data-labelling"
+
+# Where each source is built and how its own splits were decided. Written into the
+# generated README, because the three were split on three different principles and a
+# reader who assumes one rule for all of them will misread the test numbers.
+SOURCE_NOTES = {
+    "autocrops": {
+        "repo": "https://github.com/emannix/flip-geoimage-dataset-builder",
+        "repo_name": "emannix/flip-geoimage-dataset-builder",
+        "built_by": "`extract_imagery_aerial_csv.py`",
+        "rows": (
+            "One building crop per detected building cluster, cut as `.tif` from ECW "
+            "aerial imagery and filed under a generated `farm_uid`. Largely the **same "
+            "farms and the same source photographs as `historical` above**, re-cut: "
+            "where `historical` has one image of the whole farm, this has one image per "
+            "building on it. The label is the "
+            "farm's `Farm_type`, read from that farm's metadata JSON and applied to "
+            "**every** crop of the farm — so a farm's shed and its nine paddocks all "
+            "carry the farm's class."
+        ),
+        "split": (
+            "**Not geographic, and not random.** The hold-out is a curated list "
+            "inherited from the 2022 FarmFinder work, so it is the same hold-out the "
+            "original FLIP models were measured against:\n\n"
+            "- `farmfinder_test_2022.xlsx` — a crop whose source photograph is named in "
+            "this spreadsheet becomes **test**.\n"
+            "- `farmfinder_train_2022.xlsx` — the `train_exceptions` list. A non-test "
+            "crop named here is **excluded from every split**: it stays in the build's "
+            "`dataset.csv` tagged `split=\"excluded\"` but is never written to a "
+            "per-split csv, so it never reaches this dataset.\n"
+            "- Everything else is **train**, with 20% of farms promoted to **val** — "
+            "farm-grouped so a farm's crops never straddle the two, stratified on the "
+            "farm's class, `random_state=42`.\n\n"
+            "Test therefore spans the same regions as train; it is a held-out *set of "
+            "farms*, not a held-out landscape."
+        ),
+    },
+    "generalisation": {
+        "repo": "https://github.com/emannix/flip-geoimage-dataset-builder",
+        "repo_name": "emannix/flip-geoimage-dataset-builder",
+        "built_by": (
+            "`extract_imagery_aerial_csv.py` in that repository, then relabelled "
+            "crop-by-crop by `gen_dataset_croplevel.py` in **this** one"
+        ),
+        "rows": (
+            "The same kind of building crops as `autocrops`, cut from the case-study "
+            "reaches — which are the same images `historical` carries in "
+            "`gen_all_df.csv`. The "
+            "difference is the label: each crop was labelled **individually** by a human "
+            "in the workbooks under `labelled_sheets/`, rather than inheriting its "
+            "farm's class. This is the only source whose labels are crop-level, and the "
+            "only one that can say `paddock` or `other_industrial`."
+        ),
+        "split": (
+            "**Geographic — a whole-region hold-out.** The point is that the held-out "
+            "set is a different landscape, not a different farm in the same one:\n\n"
+            "- **train / val — NSW**: Bega, Caniaba, Freemans, Mangrove, Nowra.\n"
+            "- **test — VIC**: Balliang and Wyuna. `gen_dataset_croplevel.py` also names "
+            "Bacchus Marsh and Gisborne as VIC test reaches, but their workbooks are not "
+            "labelled yet, so they contribute no rows.\n\n"
+            "Within NSW the train/val cut is farm-grouped and stratified on the farm's "
+            "most common non-background crop class, 20% of farms to val, "
+            "`random_state=42`.\n\n"
+            "Because the split is regional, the class mix differs sharply between the "
+            "two sides — read the per-class test numbers with the class tables below in "
+            "hand rather than assuming train and test are comparable populations."
+        ),
+    },
+    "historical": {
+        "repo": (
+            "https://gitlab.unimelb.edu.au/farm-location-image-processing/"
+            "flip-dataset-processing"
+        ),
+        "repo_name": "farm-location-image-processing/flip-dataset-processing "
+                     "(UniMelb GitLab, not GitHub)",
+        "built_by": "`historical_processing.py`",
+        "rows": (
+            "Whole-farm `.png` photographs from the original FLIP pipeline — one image "
+            "*is* one farm, so there are no crops and no `farm_uid`. Drawn from "
+            "`2024_farms/`, `nsw_farms_data/`, `vic_farms_data/`, "
+            "`vic_farms_data_extra/`, `vic_hpai_data/` and `case study images/`."
+        ),
+        "split": (
+            "**By membership list, not geography.** Each image is tested against four "
+            "lists in turn, and whatever is left over is the training pool:\n\n"
+            "- `in_test_data` — named in `farmfinder_test_2022.xlsx` → `test_df.csv`. "
+            "The same spreadsheet defines the `autocrops` test set below, which is why "
+            "those two are two views of one hold-out rather than two independent ones.\n"
+            "- `in_train_exceptions` — named in `farmfinder_train_2022.xlsx` → excluded "
+            "from every split.\n"
+            "- `in_gen_data` — in the case-study list → `gen_all_df.csv` (everything) "
+            "and `gen_df.csv` (the same rows filtered to the ten accepted classes). "
+            "`gen_df` is a strict subset, so only `gen_all` is read here and its "
+            "labelled members are flagged `in_gen_labelled`.\n"
+            "- `in_hpai_data` — path contains `hpai` → `hpai_df.csv`.\n"
+            "- Everything else → `train_df.csv` / `val_df.csv`, an 80/20 split "
+            "stratified on `processed_class`, `random_state=42`.\n\n"
+            "That last split is **row-level, not farm-grouped** — unlike `autocrops`, "
+            "which groups by farm. This source carries no farm identity at all, so if "
+            "two photographs of one farm exist, nothing prevented them landing on "
+            "opposite sides of train/val, and nothing here can detect it."
+        ),
+    },
+}
 
 PROVENANCE_COLUMNS = [
     "source_dataset", "source_dataset_path", "source_file", "source_split",
@@ -458,13 +571,23 @@ def readme(df, totals, args, missing):
     """The provenance document, written from this run's own numbers."""
     counts = {name: int((df["split"] == name).sum()) for name in SPLIT_FILES}
     groups = df.groupby("split")["group_id"].nunique()
-    sources = df.groupby("source_dataset")
+    sources = [
+        (name, df[df["source_dataset"] == name])
+        for name in SOURCE_ORDER
+        if (df["source_dataset"] == name).any()
+    ]
 
     lines = [
         "# FLIP master dataset — original_master_2026_09_04",
         "",
         f"Built by `gen_dataset_master.py` on {pd.Timestamp.today():%Y-%m-%d} from three "
         "existing datasets. Every row records where it came from and how it was placed.",
+        "",
+        f"**Built from:** [{THIS_REPO_NAME}]({THIS_REPO}) — `gen_dataset_master.py` "
+        "assembles this directory, `gen_dataset_croplevel.py` produces the crop-level "
+        "labels one of the three sources depends on, and `labelled_sheets/` holds the "
+        "labelling workbooks those came from. Start there to rebuild or extend this "
+        "dataset.",
         "",
         f"**{len(df):,} rows** over **{df['group_id'].nunique():,} groups**, split across "
         f"{len(SPLIT_FILES)} csvs and repeated whole in `dataset.csv`. Every row of every "
@@ -487,17 +610,51 @@ def readme(df, totals, args, missing):
         "",
         "```",
     ]
-    for (dataset, source_file), n in totals.items():
+    ordered = sorted(totals.items(), key=lambda kv: SOURCE_ORDER.index(kv[0][0]))
+    for (dataset, source_file), n in ordered:
         lines.append(f"  {dataset:<15} {source_file:<24} {n:>6,} rows")
+    lines += ["```", ""]
+
+    for number, name in enumerate(SOURCE_ORDER, 1):
+        note = SOURCE_NOTES[name]
+        group = df[df["source_dataset"] == name]
+        splits = group.groupby("split").size().sort_values(ascending=False)
+        lines += [
+            f"### {number}. `{name}` — `{Path(group['source_dataset_path'].iloc[0]).name}`",
+            "",
+            f"Repository: [{note['repo_name']}]({note['repo']})",
+            "",
+            f"**Built by.** {note['built_by']}.",
+            "",
+            f"**What a row is.** {note['rows']}",
+            "",
+            f"**How it was split, upstream.** {note['split']}",
+            "",
+            "Where its rows landed here:",
+            "",
+            "```",
+        ]
+        for split, n in splits.items():
+            lines.append(f"  {split:<28} {n:>6,} rows")
+        lines += ["```", ""]
+
     lines += [
-        "```",
-        "",
         "### these sources are not independent",
         "",
         "`autocrops` and `historical` are two different crops of the same underlying "
         "source photographs, and `generalisation` is the crop-level relabelling of "
         "exactly the imagery `historical/gen_all_df.csv` holds whole. Overlap between "
         "them is therefore resolved explicitly, not assumed away.",
+        "",
+        "Two consequences worth holding onto:",
+        "",
+        "- **`test_autocrops` and `test_original` are the same hold-out.** Both are "
+        "defined by `farmfinder_test_2022.xlsx` — one at crop level, one at whole-image "
+        "level. They share 125 source photographs. Treat them as two views of one test "
+        "set, not as two independent ones.",
+        "- **`autocrops` and `generalisation` overlap by farm** (24 `farm_uid`s), even "
+        "though they never share a crop file. That is why the test-wins rule below "
+        "checks `farm_uid` as well as the source photograph.",
         "",
         "## how the splits were formed",
         "",

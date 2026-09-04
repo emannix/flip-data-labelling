@@ -252,6 +252,107 @@ Each row carries the class list and both the old and new labels, so nothing is l
 - `--imagery {symlink,copy,none}` — link or copy the crops under `--output-dir` to make
   it a standalone dataset (default `none`; only useful with `--output-dir` elsewhere).
 
+# building the master dataset
+
+`gen_dataset_master.py` combines the three current FLIP datasets into one training corpus
+with four named test sets, written to `original_master_2026_09_04/`.
+
+    python gen_dataset_master.py                 # ~38 GB of imagery copied, a few minutes
+    python gen_dataset_master.py --dry-run       # csvs + README only, no imagery
+    python gen_dataset_master_html.py            # the summary dashboard
+    xdg-open original_master_2026_09_04/summary.html
+
+The three sources, in the order the generated README introduces them:
+
+    historical       flip-dataset-processing/output/flip_historical
+                     whole-farm .png photographs from the original pipeline
+    autocrops        flip-geoimage-dataset-builder/original_new_2026_08_21
+                     building crops re-cut from those same photographs, farm-level labels
+    generalisation   flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation
+                     the case-study subset of those crops, relabelled crop by crop
+                     by `gen_dataset_croplevel.py` above
+
+They are not independent, which is the whole difficulty. `autocrops` and `historical` are
+two different crops of the same source photographs (2,398 names in common), and
+`generalisation` is the crop-level relabelling of exactly the imagery `historical` holds
+whole in `gen_all_df.csv`. Their upstream splits were also decided on three different
+principles — a curated 2022 FarmFinder hold-out for `historical` and `autocrops`, a
+geographic NSW/VIC hold-out for `generalisation` — so the generated README documents each
+one rather than leaving a reader to assume a single rule.
+
+## what comes out
+
+    dataset.csv                     25,968 rows / 7,594 groups, every row with its provenance
+    train_df.csv                    17,927      val_df.csv                       4,320
+    train_overlap.csv                  118      val_overlap.csv                     32
+    test_autocrops.csv               1,361      test_autocrop_gen_vic.csv        1,146
+    test_gen_original.csv              777      test_gen_original_overlap.csv      151
+    test_original.csv                  136
+    README.md                       generated: provenance, rules, per-split class tables
+    summary.html                    the dashboard, from gen_dataset_master_html.py
+    autocrops/ generalisation/ historical/     imagery, each at its original relative path
+
+Every input row appears exactly once across those nine csvs — the script asserts it, along
+with no group in two splits and no train/val row reaching a test set, before writing
+anything.
+
+## how overlap is resolved
+
+**Test wins.** A train/val row whose `farm_uid` *or* source-image stem appears in any of
+the four test sets is pulled out of train/val. **Nothing is deleted** — pulled rows go to
+`train_overlap.csv` / `val_overlap.csv` with an `overlap_reason`, and their imagery is
+copied like any other row. The pull is by whole group, so a group is never split between
+a split and its overlap.
+
+The one exception is `gen_all`, divided by `generalisation`'s split *before* the test pool
+is built. A literal test-wins would send 100% of `generalisation`'s train/val to overlap,
+because all of it sits inside `gen_all`; instead the 151 `gen_all` images whose crops are
+in `generalisation` train/val go to `test_gen_original_overlap.csv` and the remaining 777
+form `test_gen_original.csv`.
+
+`test_gen_original` and `test_autocrop_gen_vic` share 242 source images on purpose — both
+are test sets, and they measure whole-image old labels against crop-level new labels.
+**Never pool scores across the two.**
+
+## grouping
+
+Training is multi-label at the level the label was actually assigned, which differs by
+source. `group_id` is the unit to sample or split over:
+
+    historical       the image      3,536 groups   1 row each
+    autocrops        the farm       2,429 groups   mean 8.6 rows, max 37
+    generalisation   the image      1,629 groups   1 row each
+
+`group_id` is prefixed `<source_dataset>:` because `autocrops` and `generalisation` share
+24 `farm_uid`s, and a bare `farm_uid` would silently merge a farm-level group with the
+image-level groups of the same farm across two independently split datasets. Groups never
+span datasets; the raw `farm_uid` is still on every row.
+
+## options
+
+`gen_dataset_master.py`:
+
+- `--autocrops` / `--generalisation` / `--historical` — the three source directories.
+- `--output-dir` — where the master dataset is written (default
+  `original_master_2026_09_04/`).
+- `--imagery {copy,symlink,none}` — copy the imagery in (default), symlink it, or write
+  only the csvs.
+- `--val-fraction` — share of the `hpai` rows given to val (default 0.20). `hpai_df.csv`
+  is disjoint from `flip_historical`'s own train/val and carries no split of its own, so
+  one is assigned here, stratified on `processed_class`.
+- `--random-state` — seed for that split (default 42).
+- `--dry-run` — csvs and README, no imagery.
+
+`gen_dataset_master_html.py`:
+
+- `--dataset` — the master `dataset.csv` to summarise.
+- `--file` — where to write the html (default `summary.html` beside the dataset).
+
+The dashboard counts every breakdown three ways — images, groups and farms — because they
+do not move together: a split can be large by image and small by farm, and a class can
+look well represented while resting on a handful of farms. Only `autocrops` and
+`generalisation` carry a `farm_uid` at all.
+
 # scoring the models
 
 `gen_evaluation.py` scores the ComFe generalisation runs against the completed workbooks
