@@ -1,5 +1,8 @@
 
-
+sudo mount -t cifs -ouser=mannixe,domain=unimelb,uid=$UID,gid=$(id -g) \
+  //mediaflux.researchsoftware.unimelb.edu.au/proj-2580_modelling_animal_disease_outbreaks-1128.4.223 \
+  mnt
+  
 # SIZE=$(du -sb original_master_2026_09_04 | awk '{print $1}')
 # time tar -cf - original_master_2026_09_04 | pv -s "$SIZE" | pigz -0 > original_master_2026_09_04.tar.gz
 # # copy to mediaflux
