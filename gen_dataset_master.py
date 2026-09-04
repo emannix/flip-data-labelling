@@ -28,13 +28,21 @@ so there is no train leakage, and both are kept because they measure different t
 whole-image old labels against crop-level new labels. Rows in both carry it in
 overlap_with. Never pool scores across the two.
 
-Grouping. Training is multi-label at the level the label was actually assigned, which
-differs by source: for (1) that is the farm (one farm-level label shared by all its
-crops), for (2) and (3) it is the single image. group_id is prefixed with the source
-dataset because (1) and (2) share 24 farm_uids and a bare farm_uid would silently merge a
-farm-level group with the image-level groups of the same farm across two datasets whose
-splits were assigned independently. Groups never span datasets; the raw farm_uid stays on
-every row so merging them later remains a deliberate act.
+Grouping. A group is dataset x identifier x imagery source, and it is the unit training
+draws on, so it follows the level the labels were actually assigned at. For (1), where one
+farm-level label covers every crop of a farm in one aerial capture, the group is that
+farm-and-capture. For (2) and (3), where each image carries its own label, the group is the
+single image.
+
+The capture is in the key because a farm is often flown more than once: 675 of the 2,429
+autocrops farms appear in two or more ECW captures, and crops from two flights are two
+photographs of the farm rather than one. Keying on the farm alone merged them into groups
+of up to 37; with the capture in the key every group is capped at the builder's ten
+building clusters per farm per capture, which the build asserts rather than assumes.
+
+group_id is prefixed with the dataset because (1) and (2) share 24 farm_uids and would
+otherwise merge across two independently split sources. The raw farm_uid and ecw_stem stay
+on every row, so regrouping (2) by farm and capture later remains available.
 
 Output goes to original_master_2026_09_04/ — the csvs and README at the top, each source's
 imagery copied into its own subfolder at its original relative path.
@@ -104,6 +112,33 @@ OVERLAP_OF = {"train": "train_overlap", "val": "val_overlap"}
 
 VAL_FRACTION = 0.20
 RANDOM_STATE = 42
+
+# A group is dataset x identifier x imagery source. The imagery source matters because a
+# farm is often flown more than once: 675 of the 2,429 autocrops farms appear in two or
+# more ECW captures, and crops from different captures are different photographs of the
+# farm, not the same one. Keying on the farm alone merged them and produced groups of up
+# to 37; adding the capture caps every group at the builder's ten building clusters per
+# farm per capture, which is asserted rather than assumed.
+MAX_GROUP = 10
+
+# How each source groups, declared once and read by both the loaders and the README.
+# The group is the unit training draws on, so it follows the level the labels were
+# actually assigned at: a whole farm-and-capture where one label covers every crop of it,
+# and the single image where each image was labelled on its own.
+GROUP_SPEC = {
+    "historical": {
+        "identifier": "image_files_out_rel", "imagery": "collection", "level": "image",
+        "describe": ("the image path", "the collection directory"),
+    },
+    "autocrops": {
+        "identifier": "farm_uid", "imagery": "ecw_stem", "level": "farm+capture",
+        "describe": ("`farm_uid`", "`ecw_stem` (the capture)"),
+    },
+    "generalisation": {
+        "identifier": "image_path", "imagery": "ecw_stem", "level": "image",
+        "describe": ("the crop's own path", "`ecw_stem` (the capture)"),
+    },
+}
 
 # The order the three sources are introduced in: the original pipeline first, then the
 # two builds derived from its imagery, so each one can be explained in terms of the last.
@@ -239,7 +274,9 @@ PROVENANCE_COLUMNS = [
     "source_dataset", "source_dataset_path", "source_file", "source_split",
     "label_level", "label_status",
 ]
-GROUP_COLUMNS = ["group_id", "group_level", "group_size"]
+GROUP_COLUMNS = [
+    "group_id", "group_level", "group_size", "group_identifier", "group_imagery",
+]
 IDENTITY_COLUMNS = [
     "image_path", "source_relpath", "source_image_path", "source_image_relpath",
     "source_image_name", "source_image_stem", "farm_uid",
@@ -276,7 +313,8 @@ def read_csv(path):
 
 
 def normalise(df, dataset, root, source_file, source_split, label_level,
-              image_path, source_image_path, source_image_name, group_key):
+              image_path, source_image_path, source_image_name,
+              group_identifier, group_imagery, group_level):
     """One source's rows in the unified schema, with provenance stamped on.
 
     The caller passes the source's own column names for the four things every source
@@ -306,11 +344,16 @@ def normalise(df, dataset, root, source_file, source_split, label_level,
     out["source_image_stem"] = out["source_image_name"].map(stem)
     out["farm_uid"] = df["farm_uid"].astype(str) if "farm_uid" in df else ""
 
-    # the group is the unit the label was asserted over: the farm for (1), the image for
-    # (2) and (3). Prefixed with the dataset so groups never span datasets.
-    out["group_level"] = "farm" if group_key == "farm_uid" else "image"
-    key = df[group_key] if group_key in df else df[image_path]
-    out["group_id"] = dataset + ":" + key.astype(str)
+    # dataset x identifier x imagery source. The identifier is the farm where there is
+    # one and the image itself otherwise; the imagery source is the capture the crop came
+    # from, so two flights over one farm stay two groups. Prefixed with the dataset so a
+    # farm_uid shared between two independently split sources cannot merge their groups.
+    out["group_level"] = group_level
+    out["group_identifier"] = df[group_identifier].astype(str)
+    out["group_imagery"] = df[group_imagery].astype(str)
+    out["group_id"] = (
+        dataset + ":" + out["group_identifier"] + ":" + out["group_imagery"]
+    )
 
     # every source already carries its labels as binary_ columns; the class list is their
     # union in canonical order, so it is derived the same way for all three
@@ -336,34 +379,56 @@ def normalise(df, dataset, root, source_file, source_split, label_level,
     return out
 
 
+def group_args(dataset):
+    """The grouping keyword arguments `normalise` takes for one source."""
+    spec = GROUP_SPEC[dataset]
+    return {
+        "group_identifier": spec["identifier"],
+        "group_imagery": spec["imagery"],
+        "group_level": spec["level"],
+    }
+
+
 def load_autocrops(root):
-    """(1) — farm-level labels, so the group is the farm and its crops share one label."""
+    """(1) — one farm-level label covers every crop of a farm in one aerial capture, so
+    that farm-and-capture is the group."""
     frames = []
     for split in ("train", "val", "test"):
         name = f"{split}_df.csv"
         frames.append(normalise(
             read_csv(root / name), "autocrops", root, name, split, "farm",
             image_path="image_path", source_image_path="source_image_path",
-            source_image_name="filename", group_key="farm_uid",
+            source_image_name="filename", **group_args("autocrops"),
         ))
     return pd.concat(frames, ignore_index=True)
 
 
 def load_generalisation(root):
-    """(2) — crop-level labels from the workbooks, so each crop is its own group."""
+    """(2) — crop-level labels from the workbooks, so each crop is its own group.
+
+    Its crops sit on the same farms and captures as (1)'s, but every one of them was
+    labelled individually, so the crop is what training draws on and the group is the
+    single image. Split integrity does not rest on that: this source's own split is
+    geographic and farm-grouped upstream, so no farm straddles train, val and test even
+    though group_id no longer says so. farm_uid and ecw_stem stay on every row for anyone
+    who wants to regroup by farm and capture.
+    """
     frames = []
     for split in ("train", "val", "test"):
         name = f"relabelled_{split}_df.csv"
         frames.append(normalise(
             read_csv(root / name), "generalisation", root, name, split, "crop",
             image_path="image_path", source_image_path="source_image_path",
-            source_image_name="filename", group_key="image_path",
+            source_image_name="filename", **group_args("generalisation"),
         ))
     return pd.concat(frames, ignore_index=True)
 
 
 def load_historical(root):
-    """(3) — one whole-farm image per row, so the group is the image.
+    """(3) — one whole-farm image per row, so the group is that image.
+
+    There is no farm identity and no capture to key on, so the identifier is the image's
+    own path and the imagery source is the collection directory it was filed under.
 
     gen_df.csv is a strict subset of gen_all_df.csv (166 of 928), so only gen_all is read
     and the 166 are flagged with in_gen_labelled rather than counted twice.
@@ -375,10 +440,11 @@ def load_historical(root):
                         ("gen_all", "gen_all_df.csv")]:
         raw = pd.read_csv(root / name)
         raw["in_gen_labelled"] = raw["image_name"].map(stem).isin(labelled)
+        raw["collection"] = raw["image_files_out_rel"].astype(str).str.split("/").str[0]
         frames.append(normalise(
             raw, "historical", root, name, split, "farm",
             image_path="image_files_out_rel", source_image_path=None,
-            source_image_name="image_name", group_key="image_files_out_rel",
+            source_image_name="image_name", **group_args("historical"),
         ))
     return pd.concat(frames, ignore_index=True)
 
@@ -508,6 +574,14 @@ def check(df, totals):
         problems.append(
             f"{len(straddling)} group_ids appear in more than one split, e.g. "
             f"{sorted(straddling.index)[:3]}"
+        )
+
+    oversized = df.groupby("group_id").size()
+    oversized = oversized[oversized > MAX_GROUP]
+    if not oversized.empty:
+        problems.append(
+            f"{len(oversized)} groups hold more than {MAX_GROUP} rows, e.g. "
+            f"{oversized.sort_values(ascending=False).head(3).to_dict()}"
         )
 
     duplicated = df["image_path"].duplicated()
@@ -720,41 +794,63 @@ def readme(df, totals, args, missing):
         "",
         "## grouping",
         "",
-        "Training is multi-label at the level the label was actually assigned, and that "
-        "level is not the same in all three sources. `group_id` is the unit to sample, "
-        "split or aggregate over.",
+        "A group is **dataset x identifier x imagery source**, and it is the unit "
+        "training draws on — so it follows the level the labels were actually assigned "
+        "at. Where one farm-level label covers every crop of a farm in one aerial "
+        "capture, the group is that farm-and-capture. Where each image carries its own "
+        "label, the group is the single image.",
         "",
-        "| source | group | rows per group |",
-        "|---|---|---|",
+        "| source | identifier | imagery source | groups | rows per group |",
+        "|---|---|---|---|---|",
     ]
     for name, group in sources:
         sizes = group.groupby("group_id").size()
+        identifier, imagery = GROUP_SPEC[name]["describe"]
         lines.append(
-            f"| `{name}` | the {group['group_level'].iloc[0]} | "
+            f"| `{name}` | {identifier} | {imagery} | {sizes.size:,} | "
             f"mean {sizes.mean():.1f}, max {sizes.max()} |"
         )
     lines += [
         "",
-        "- `group_id` — `<source_dataset>:<farm_uid or source-relative image path>`",
-        "- `group_level` — `farm` (a group spans several images) or `image` (one image)",
+        "- `group_id` — `<source_dataset>:<group_identifier>:<group_imagery>`",
+        "- `group_identifier` / `group_imagery` — the two parts, kept as their own "
+        "columns so the grouping can be inspected or rebuilt",
+        "- `group_level` — `farm+capture` or `image`",
         "- `group_size` — rows in this group",
         "",
-        "The `<source_dataset>:` prefix matters. `autocrops` and `generalisation` share "
-        "24 `farm_uid`s, and a bare `farm_uid` would silently merge a farm-level group "
-        "with the image-level groups of the same farm across two datasets whose splits "
-        "were assigned independently. **Groups never span datasets.** The raw `farm_uid` "
-        "is still on every row, so merging them later stays a deliberate act.",
+        f"**Every group holds at most {MAX_GROUP} rows**, asserted at build time. That "
+        "ceiling is the builder's limit of ten building clusters per farm per capture, "
+        "not a cap applied here.",
         "",
-        "No `group_id` appears in more than one split — asserted at build time.",
+        "**Why the capture is in the key.** A farm is often flown more than once — 675 "
+        "of the 2,429 `autocrops` farms appear in two or more ECW captures. Crops from "
+        "two flights are two photographs of the farm, not one, so keying on the farm "
+        "alone merged them and produced groups of up to 37. Splitting on the capture as "
+        "well keeps each group to a single photograph of a single place.",
+        "",
+        "**`generalisation` groups by image, not by farm.** Its crops sit on the same "
+        "farms and captures as `autocrops`, but every one of them was labelled "
+        "individually in the workbooks, so the crop is what training draws on. Split "
+        "integrity does not rest on that: this source's own split is geographic and "
+        "farm-grouped upstream, so no farm straddles its train, val and test even though "
+        "`group_id` no longer says so. `farm_uid` and `ecw_stem` are on every row for "
+        "anyone who wants to regroup it by farm and capture.",
+        "",
+        "**Why the dataset is in the key.** `autocrops` and `generalisation` share 24 "
+        "`farm_uid`s, and a bare identifier would merge groups across two sources whose "
+        "splits were assigned independently. **Groups never span datasets.** The raw "
+        "`farm_uid` is still on every row, so merging them later stays a deliberate act.",
+        "",
+        "No `group_id` appears in more than one split — also asserted at build time.",
         "",
         "`group_level` is about how many images share a label; `label_level` is about "
         "what the label describes. They differ for `historical`: its groups are single "
         "images, but each image is a whole farm, so its labels are farm-level.",
         "",
-        "Group sizes are very uneven — an `autocrops` farm averages several crops while "
-        "the other two sources are one row per group — so sampling by group and sampling "
-        "by row give quite different class balances. That is a training-side decision "
-        "this dataset does not make for you; `group_size` is here so either is available.",
+        "Group sizes are uneven — `autocrops` averages several rows per group while the "
+        "other two are one row per group — so sampling by group and sampling by row give "
+        "quite different class balances. That is a training-side decision this dataset "
+        "does not make for you; `group_size` is here so either is available.",
         "",
         "## labels",
         "",
@@ -795,7 +891,8 @@ def readme(df, totals, args, missing):
         "- `label_level` — `farm` or `crop`; what the label describes",
         "- `label_status` — `labelled`, or the placeholder class for unlabelled rows",
         "",
-        "**Grouping** — `group_id`, `group_level`, `group_size`",
+        "**Grouping** — `group_id`, `group_identifier`, `group_imagery`, "
+        "`group_level`, `group_size`",
         "",
         "**Overlap**",
         "",

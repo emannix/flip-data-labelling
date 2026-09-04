@@ -316,17 +316,29 @@ are test sets, and they measure whole-image old labels against crop-level new la
 
 ## grouping
 
-Training is multi-label at the level the label was actually assigned, which differs by
-source. `group_id` is the unit to sample or split over:
+A group is **dataset x identifier x imagery source** — the unit training draws on, so it
+follows the level the labels were actually assigned at:
 
-    historical       the image      3,536 groups   1 row each
-    autocrops        the farm       2,429 groups   mean 8.6 rows, max 37
-    generalisation   the image      1,629 groups   1 row each
+    historical       image path x collection      3,536 groups   1 row each
+    autocrops        farm_uid x ecw_stem          3,208 groups   mean 6.5, max 10
+    generalisation   crop path x ecw_stem         1,629 groups   1 row each
 
-`group_id` is prefixed `<source_dataset>:` because `autocrops` and `generalisation` share
-24 `farm_uid`s, and a bare `farm_uid` would silently merge a farm-level group with the
-image-level groups of the same farm across two independently split datasets. Groups never
-span datasets; the raw `farm_uid` is still on every row.
+`autocrops` groups by farm because one farm-level label covers every crop of it; the other
+two group by image because each image carries its own label. `generalisation` in
+particular sits on the same farms as `autocrops` but was labelled crop by crop, so the
+crop is the training example — its split integrity comes from its own farm-grouped
+geographic split upstream, not from `group_id`.
+
+The **capture** is in the key because a farm is often flown more than once: 675 of the
+2,429 `autocrops` farms appear in two or more ECW captures, and crops from two flights are
+two photographs of the farm rather than one. Keying on the farm alone merged them into
+groups of up to 37; with the capture in the key every group is capped at the builder's ten
+building clusters per farm per capture — asserted at build time, not imposed here.
+
+The **dataset** is in the key because `autocrops` and `generalisation` share 24
+`farm_uid`s, and a bare identifier would merge groups across two independently split
+sources. Groups never span datasets and never span splits; the raw `farm_uid`,
+`group_identifier` and `group_imagery` are all kept as columns.
 
 ## options
 

@@ -11,8 +11,8 @@ The question it answers is what is actually in each split, counted three ways, b
 the dataset counts three different things and they do not move together:
 
     images   one row — one crop or one whole-farm photograph
-    groups   the unit a label was asserted over: the farm for autocrops, the image
-             for generalisation and historical
+    groups   dataset x identifier x imagery source — the unit training draws on: one
+             farm in one aerial capture for autocrops, the single image for the others
     farms    distinct farm_uid — autocrops and generalisation only; the historical
              pipeline carries no farm identity at all
 
@@ -86,7 +86,7 @@ CLASSES = [
 
 UNITS = {
     "images": "one row — a crop, or a whole-farm photograph",
-    "groups": "the unit the label was asserted over",
+    "groups": "dataset x identifier x imagery source; at most 10 rows",
     "farms": "distinct farm_uid; historical carries none",
 }
 
@@ -120,14 +120,19 @@ def tip(content: str) -> str:
 
 
 def rounded_right(x: float, y: float, width: float, height: float, radius: float = 4) -> str:
-    """A bar anchored at its start with only its data end rounded."""
+    """A bar anchored at its start with only its data end rounded.
+
+    Returns the finished <path> element, not bare path data: an unwrapped `d` string
+    dropped into the svg renders as nothing at all, and since this shape is only used for
+    the *last* segment of a row, that failure hides whole bars rather than looking broken.
+    """
     radius = max(0.0, min(radius, width, height / 2))
     return (
-        f"M{x:g},{y:g} H{x + width - radius:g} "
+        f'<path d="M{x:g},{y:g} H{x + width - radius:g} '
         f"Q{x + width:g},{y:g} {x + width:g},{y + radius:g} "
         f"V{y + height - radius:g} "
         f"Q{x + width:g},{y + height:g} {x + width - radius:g},{y + height:g} "
-        f"H{x:g} Z"
+        f'H{x:g} Z" />'
     )
 
 
@@ -238,136 +243,23 @@ def class_by_split(df: pd.DataFrame, unit: str) -> pd.DataFrame:
 # --------------------------------------------------------------------------------------
 
 
-def stacked_bars(table: pd.DataFrame, unit: str, note: str = "") -> str:
-    """Horizontal stacked bars, one row per split, segmented by source dataset.
+# A segment this thin is still drawn at this width, so a small source never vanishes
+# from a bar. It overstates the smallest categories by a few pixels — generalisation is
+# 2% of train and 86 rows of val — so every stacked chart ships the exact counts in a
+# table beside it rather than leaving the bar as the only record.
+MIN_SEGMENT = 5.0
+
+
+def stacked_chart(table: pd.DataFrame, unit: str, *, width: float = 900,
+                  label_w: float = 210, pad_r: float = 78, row_h: float = 26,
+                  gap: float = 9, axis_title: str = "", label: str = "") -> str:
+    """Horizontal stacked bars: one row per index entry, segmented by source dataset.
 
     Every segment wide enough to hold its own number is labelled in place and the row
     total sits at the end, so the chart reads without the legend — which matters because
     one of the three hues is deliberately low-contrast on the light surface.
     """
-    label_w, pad_r, row_h, gap = 210, 74, 26, 9
-    width, top = 900, 30
-    plot_w = width - label_w - pad_r
-    height = top + len(table) * (row_h + gap) + 26
-    ceiling = max(table.sum(axis=1).max(), 1)
-    ticks = nice_ticks(ceiling)
-    scale = plot_w / max(ticks[-1], 1)
-
-    parts = []
-    for value in ticks:
-        x = label_w + value * scale
-        parts.append(
-            f'<line class="grid" x1="{x:g}" y1="{top - 6:g}" x2="{x:g}" '
-            f'y2="{height - 26:g}" />'
-        )
-        parts.append(text(x, top - 12, f"{value:,.0f}", "tick", "middle"))
-
-    for index, split in enumerate(table.index):
-        y = top + index * (row_h + gap)
-        total = int(table.loc[split].sum())
-        parts.append(text(label_w - 12, y + row_h / 2 + 4, split, "rowlabel", "end"))
-        segments = int((table.loc[split] > 0).sum())
-        cursor = 0.0
-        for source in SOURCE_ORDER:
-            value = int(table.loc[split, source])
-            if value <= 0:
-                continue
-            # 2px surface gap between segments, so adjacent fills never touch
-            segment = value * scale
-            drawn = max(segment - 2, 1)
-            last = cursor + segment >= total * scale - 0.01
-            shape = (
-                rounded_right(label_w + cursor, y, drawn, row_h)
-                if last
-                else f'<rect x="{label_w + cursor:g}" y="{y:g}" width="{drawn:g}" '
-                     f'height="{row_h:g}" />'
-            )
-            parts.append(
-                f'<g class="mark" fill="var(--src-{source})">{tip(f"{split} · {source}: {value:,} {unit}")}'
-                f"{shape}</g>"
-            )
-            if drawn > 46 and segments > 1:
-                parts.append(text(
-                    label_w + cursor + drawn / 2, y + row_h / 2 + 4,
-                    f"{value:,}", "inbar", "middle",
-                ))
-            cursor += segment
-        parts.append(text(
-            label_w + cursor + 9, y + row_h / 2 + 4, f"{total:,}", "note-strong",
-        ))
-    if note:
-        parts.append(text(label_w, height - 6, note, "axistitle"))
-    return svg(width, height, "".join(parts), f"{unit} per split by source dataset")
-
-
-def class_bars(df: pd.DataFrame, unit: str) -> str:
-    """Total per class across the whole dataset, segmented by which source supplied it."""
-    rows = exploded(df)
-    table = pd.DataFrame(0, index=CLASSES, columns=SOURCE_ORDER, dtype=int)
-    for (cls, source), group in rows.groupby(["cls", "source_dataset"]):
-        if cls in table.index:
-            table.loc[cls, source] = count(group, unit)
-    table = table.loc[table.sum(axis=1).sort_values(ascending=False).index]
-
-    label_w, pad_r, row_h, gap = 150, 78, 22, 7
-    width, top = 900, 30
-    plot_w = width - label_w - pad_r
-    height = top + len(table) * (row_h + gap) + 22
-    ticks = nice_ticks(max(table.sum(axis=1).max(), 1))
-    scale = plot_w / max(ticks[-1], 1)
-
-    parts = []
-    for value in ticks:
-        x = label_w + value * scale
-        parts.append(
-            f'<line class="grid" x1="{x:g}" y1="{top - 6:g}" x2="{x:g}" '
-            f'y2="{height - 22:g}" />'
-        )
-        parts.append(text(x, top - 12, f"{value:,.0f}", "tick", "middle"))
-
-    for index, cls in enumerate(table.index):
-        y = top + index * (row_h + gap)
-        total = int(table.loc[cls].sum())
-        parts.append(text(label_w - 12, y + row_h / 2 + 4, cls, "rowlabel", "end"))
-        cursor = 0.0
-        for source in SOURCE_ORDER:
-            value = int(table.loc[cls, source])
-            if value <= 0:
-                continue
-            segment = value * scale
-            drawn = max(segment - 2, 1)
-            last = cursor + segment >= total * scale - 0.01
-            shape = (
-                rounded_right(label_w + cursor, y, drawn, row_h)
-                if last
-                else f'<rect x="{label_w + cursor:g}" y="{y:g}" width="{drawn:g}" '
-                     f'height="{row_h:g}" />'
-            )
-            parts.append(
-                f'<g class="mark" fill="var(--src-{source})">'
-                f'{tip(f"{cls} · {source}: {value:,} {unit}")}{shape}</g>'
-            )
-            cursor += segment
-        parts.append(text(
-            label_w + cursor + 9, y + row_h / 2 + 4, f"{total:,}", "note-strong",
-        ))
-    return svg(width, height, "".join(parts), f"{unit} per class by source dataset")
-
-
-def group_sizes(df: pd.DataFrame) -> str:
-    """How many images each group holds, which is what makes the two counts diverge."""
-    sizes = df.groupby(["source_dataset", "group_id"]).size().reset_index(name="size")
-    buckets = [(1, 1), (2, 3), (4, 6), (7, 9), (10, 14), (15, 19), (20, 999)]
-    names = ["1", "2-3", "4-6", "7-9", "10-14", "15-19", "20+"]
-    table = pd.DataFrame(0, index=names, columns=SOURCE_ORDER, dtype=int)
-    for source, group in sizes.groupby("source_dataset"):
-        for name, (low, high) in zip(names, buckets):
-            table.loc[name, source] = int(
-                ((group["size"] >= low) & (group["size"] <= high)).sum()
-            )
-
-    label_w, pad_r, row_h, gap = 120, 78, 24, 8
-    width, top = 620, 30
+    top = 30
     plot_w = width - label_w - pad_r
     height = top + len(table) * (row_h + gap) + 30
     ticks = nice_ticks(max(table.sum(axis=1).max(), 1))
@@ -381,18 +273,22 @@ def group_sizes(df: pd.DataFrame) -> str:
             f'y2="{height - 30:g}" />'
         )
         parts.append(text(x, top - 12, f"{value:,.0f}", "tick", "middle"))
+
     for index, name in enumerate(table.index):
         y = top + index * (row_h + gap)
         total = int(table.loc[name].sum())
+        segments = int((table.loc[name] > 0).sum())
         parts.append(text(label_w - 12, y + row_h / 2 + 4, name, "rowlabel", "end"))
         cursor = 0.0
-        for source in SOURCE_ORDER:
+        for position, source in enumerate(SOURCE_ORDER):
             value = int(table.loc[name, source])
             if value <= 0:
                 continue
-            segment = value * scale
-            drawn = max(segment - 2, 1)
-            last = cursor + segment >= total * scale - 0.01
+            # 2px surface gap between segments, and a floor so a tiny source stays visible
+            drawn = max(value * scale - 2, MIN_SEGMENT)
+            last = position == max(
+                i for i, s in enumerate(SOURCE_ORDER) if table.loc[name, s] > 0
+            )
             shape = (
                 rounded_right(label_w + cursor, y, drawn, row_h)
                 if last
@@ -401,15 +297,79 @@ def group_sizes(df: pd.DataFrame) -> str:
             )
             parts.append(
                 f'<g class="mark" fill="var(--src-{source})">'
-                f'{tip(f"{name} images per group · {source}: {value:,} groups")}{shape}</g>'
+                f'{tip(f"{name} · {source}: {value:,} {unit}")}{shape}</g>'
             )
-            cursor += segment
+            if drawn > 46 and segments > 1:
+                parts.append(text(
+                    label_w + cursor + drawn / 2, y + row_h / 2 + 4,
+                    f"{value:,}", "inbar", "middle",
+                ))
+            cursor += drawn + 2
         parts.append(text(
-            label_w + cursor + 9, y + row_h / 2 + 4, f"{total:,}", "note-strong",
+            label_w + cursor + 7, y + row_h / 2 + 4, f"{total:,}", "note-strong",
         ))
-    parts.append(text(label_w, height - 8, "groups", "axistitle"))
-    return svg(width, height, "".join(parts), "group size distribution by source dataset")
+    if axis_title:
+        parts.append(text(label_w, height - 8, axis_title, "axistitle"))
+    return svg(width, height, "".join(parts), label or f"{unit} per row by source dataset")
 
+
+def source_table(table: pd.DataFrame, unit: str, index_label: str) -> str:
+    """The exact counts behind a stacked chart, since the thinnest segments are floored."""
+    head = (
+        f"<tr><th>{escape(index_label)}</th>"
+        + "".join(f"<th>{escape(s)}</th>" for s in SOURCE_ORDER)
+        + "<th>total</th></tr>"
+    )
+    body = []
+    for name in table.index:
+        cells = "".join(
+            f"<td>{int(table.loc[name, s]):,}</td>" if table.loc[name, s] else
+            '<td class="muted">&middot;</td>'
+            for s in SOURCE_ORDER
+        )
+        body.append(
+            f'<tr><th scope="row">{escape(name)}</th>{cells}'
+            f"<td>{int(table.loc[name].sum()):,}</td></tr>"
+        )
+    totals = "".join(f"<td>{int(table[s].sum()):,}</td>" for s in SOURCE_ORDER)
+    body.append(
+        f'<tr class="total"><th scope="row">all</th>{totals}'
+        f'<td>{int(table.to_numpy().sum()):,}</td></tr>'
+    )
+    return (
+        f'<details><summary>Exact {escape(unit)} counts</summary>'
+        f'<div class="scroll"><table class="data"><thead>{head}</thead>'
+        f'<tbody>{"".join(body)}</tbody></table></div></details>'
+    )
+
+
+def stacked_bars(table: pd.DataFrame, unit: str) -> str:
+    return stacked_chart(table, unit, axis_title=unit,
+                         label=f"{unit} per split by source dataset")
+
+
+def class_table(df: pd.DataFrame, unit: str) -> pd.DataFrame:
+    """Totals per class across the whole dataset, by which source supplied them."""
+    rows = exploded(df)
+    table = pd.DataFrame(0, index=CLASSES, columns=SOURCE_ORDER, dtype=int)
+    for (cls, source), group in rows.groupby(["cls", "source_dataset"]):
+        if cls in table.index:
+            table.loc[cls, source] = count(group, unit)
+    return table.loc[table.sum(axis=1).sort_values(ascending=False).index]
+
+
+def group_size_table(df: pd.DataFrame) -> pd.DataFrame:
+    """How many groups hold how many images, by source."""
+    sizes = df.groupby(["source_dataset", "group_id"]).size().reset_index(name="size")
+    buckets = [(1, 1), (2, 3), (4, 6), (7, 9), (10, 14), (15, 19), (20, 10**9)]
+    names = ["1", "2-3", "4-6", "7-9", "10-14", "15-19", "20+"]
+    table = pd.DataFrame(0, index=names, columns=SOURCE_ORDER, dtype=int)
+    for source, group in sizes.groupby("source_dataset"):
+        for name, (low, high) in zip(names, buckets):
+            table.loc[name, source] = int(
+                ((group["size"] >= low) & (group["size"] <= high)).sum()
+            )
+    return table
 
 def class_matrix(table: pd.DataFrame, unit: str) -> str:
     """Classes x splits, shaded by each class's share of its split, labelled with counts.
@@ -877,12 +837,17 @@ def build(dataset: Path) -> str:
 <section>
   <h2>The three units</h2>
   <p class="lede">An <strong>image</strong> is one row &mdash; a building crop, or a
-  whole-farm photograph. A <strong>group</strong> is the unit its label was asserted over:
-  the farm for <code>autocrops</code>, whose farm-level label is shared by all its crops,
-  and the single image for the other two. A <strong>farm</strong> is a distinct
-  <code>farm_uid</code>, which only <code>autocrops</code> and <code>generalisation</code>
-  carry &mdash; the historical pipeline has no farm identity, so it contributes images and
-  groups but no farms.</p>
+  whole-farm photograph. A <strong>group</strong> is
+  <code>dataset &times; identifier &times; imagery source</code>, the unit training draws
+  on, so it follows the level the labels were assigned at. For <code>autocrops</code>, one
+  farm-level label covers every crop of a farm in <em>one aerial capture</em> &mdash; a
+  farm flown twice is two groups, because two flights are two photographs &mdash; capped
+  at <strong>10</strong> rows, the builder's limit of ten building clusters per farm per
+  capture. For <code>generalisation</code> and <code>historical</code>, each image carries
+  its own label, so each is its own group. A <strong>farm</strong> is a distinct
+  <code>farm_uid</code>, which only <code>autocrops</code> and
+  <code>generalisation</code> carry &mdash; the historical pipeline has no farm identity,
+  so it contributes images and groups but no farms.</p>
   <div class="card">{units_table(df)}</div>
 </section>
 """,
@@ -894,15 +859,18 @@ def build(dataset: Path) -> str:
   same farms seen many times over.</p>
   <div class="card">
     <div class="card-head"><h3>Images &mdash; one row each</h3>{legend()}</div>
-    <div class="scroll">{stacked_bars(by_split_source(df, "images"), "images", "images")}</div>
+    <div class="scroll">{stacked_bars(by_split_source(df, "images"), "images")}</div>
+    {source_table(by_split_source(df, "images"), "images", "split")}
   </div>
   <div class="card">
-    <div class="card-head"><h3>Groups &mdash; the label unit</h3>{legend()}</div>
-    <div class="scroll">{stacked_bars(by_split_source(df, "groups"), "groups", "groups")}</div>
+    <div class="card-head"><h3>Groups &mdash; the training unit</h3>{legend()}</div>
+    <div class="scroll">{stacked_bars(by_split_source(df, "groups"), "groups")}</div>
+    {source_table(by_split_source(df, "groups"), "groups", "split")}
   </div>
   <div class="card">
     <div class="card-head"><h3>Farms &mdash; distinct <code>farm_uid</code></h3>{legend()}</div>
-    <div class="scroll">{stacked_bars(by_split_source(df, "farms"), "farms", "farms")}</div>
+    <div class="scroll">{stacked_bars(by_split_source(df, "farms"), "farms")}</div>
+    {source_table(by_split_source(df, "farms"), "farms", "split")}
   </div>
 </section>
 """,
@@ -929,7 +897,8 @@ def build(dataset: Path) -> str:
   </div>
   <div class="card">
     <div class="card-head"><h3>Which source supplies each class</h3>{legend()}</div>
-    <div class="scroll">{class_bars(df, "images")}</div>
+    <div class="scroll">{stacked_chart(class_table(df, "images"), "images", label_w=150, row_h=22, gap=7, axis_title="images", label="images per class by source dataset")}</div>
+    {source_table(class_table(df, "images"), "images", "class")}
   </div>
 </section>
 """,
@@ -937,12 +906,14 @@ def build(dataset: Path) -> str:
 <section>
   <h2>Why images and groups diverge</h2>
   <p class="lede">Group size is the whole of the difference. Every
-  <code>generalisation</code> and <code>historical</code> group is a single image; an
-  <code>autocrops</code> group is a farm and averages several crops, so sampling by group
-  and sampling by image give quite different class balances.</p>
+  <code>generalisation</code> and <code>historical</code> group is a single image, while
+  an <code>autocrops</code> group is one farm in one capture and averages several crops
+  &mdash; so sampling by group and sampling by image give quite different class balances.
+  Nothing exceeds ten.</p>
   <div class="card">
     <div class="card-head"><h3>Images per group</h3>{legend()}</div>
-    <div class="scroll">{group_sizes(df)}</div>
+    <div class="scroll">{stacked_chart(group_size_table(df), "groups", width=620, label_w=120, row_h=24, gap=8, axis_title="groups", label="group size distribution by source dataset")}</div>
+    {source_table(group_size_table(df), "groups", "images per group")}
   </div>
   <div class="card">
     <div class="card-head"><h3>Rows carrying more than one class</h3></div>
@@ -986,7 +957,10 @@ def build(dataset: Path) -> str:
     <code>generalisation</code> rows.</p>
     <p><strong>Farms are not comparable across sources.</strong> Only
     <code>autocrops</code> and <code>generalisation</code> carry a <code>farm_uid</code>,
-    and they share 24 of them. Groups are prefixed by source and never span datasets.</p>
+    and they share 24 of them. Groups are keyed by source as well as identifier and
+    capture, so they never span datasets and never span splits. <code>generalisation</code>
+    groups by image because its labels are per-crop; its split integrity comes from its
+    own farm-grouped geographic split upstream.</p>
     <p><strong>Class counts double-count multi-label rows.</strong> A row labelled
     <code>dairy,horse</code> appears under both, so the class columns sum to more than the
     split's row count.</p>
