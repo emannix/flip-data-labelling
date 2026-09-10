@@ -443,6 +443,38 @@ spread without re-reading the runs.
 - `--file` — where to write the HTML (default `<output>/gen_evaluation_dashboard.html`).
 
 
+## the dated successors
+
+`gen_evaluation.py` scores the original ComFe generalisation runs against the workbooks.
+Two later scripts score later sweeps against the crop-level relabelled VIC hold-out and
+write CSVs *and* the dashboard themselves in one pass, so there is no separate dashboard
+step:
+
+- `gen_evaluation_2026_08_21.py` — the two multiclass families against the 2026-08-21
+  multilabel pair (DINOv2 linear probe, ComFe), on `relabelled_test_df.csv`. Writes
+  `output_eval_2026_08_21/`.
+- `gen_evaluation_2026_09_04.py` — the same four plus the 2026-09-04 pair retrained on
+  `original_master_2026_09_04/train_df.csv`, on `test_autocrop_gen_vic.csv` (the same
+  1,146 crops row for row, checked at load time). Writes `output_eval_2026_09_04/`.
+
+      .venv/bin/python gen_evaluation_2026_09_04.py
+      xdg-open output_eval_2026_09_04/evaluation_dashboard.html
+
+The 2026-09-04 page adds two things. The per-class table carries a training count per
+multilabel generation (397 relabelled NSW crops against 17,927 master crops, of which
+only the 397 are crop-labelled), and a class is well sampled only if it clears the bar in
+both. And it ends with a gallery of real hold-out farms — the whole-farm image beside
+every building crop, each crop's annotation and every model's top class — chosen per
+annotated class as the newest ComFe's highest-, median- and lowest-scoring farm, so each
+group shows a miss beside a hit. `examples.csv` records which farms and why. The
+imagery is inlined as small JPEGs, so the page is a few megabytes and opens anywhere.
+
+The 2026-09-04 runs save their prediction index as the test split's `group_id` rather
+than a row number (the data module was given `test_csv_group`); the loader maps either
+form back onto rows. Both scripts take `--aggregation {max,mean,top2}`, `--bootstrap`
+(default 200), `--seed`, `--output` and `--file`.
+
+
 # Notes from next
 
 Out of distribution stuff
