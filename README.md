@@ -477,7 +477,9 @@ form back onto rows. Both scripts take `--aggregation {max,mean,top2}`, `--boots
 a farm's scores become predicted classes — `prevalence` (default) predicts each class for
 as many farms as are annotated with it, so precision equals recall and the diagonal reads
 as recall; a number predicts every class scoring above it. The operating points land in
-`operating_points_farm.csv`.
+`operating_points_farm.csv`. A second farm-level panel repeats this with beef + dairy
+merged into `cattle` and the three pig classes into `pigs` (`CLASS_GROUPS` in the
+script), writing `confusion_farm_merged.csv` and `operating_points_farm_merged.csv`.
 
 
 # Notes from next

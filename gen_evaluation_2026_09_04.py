@@ -920,6 +920,58 @@ def confusion(truth: pd.DataFrame, model: dict, extra_row: str) -> pd.DataFrame:
 
 NOTHING_PREDICTED = "nothing predicted"
 
+# Coarser classes for a second farm-level panel: the labellers' own confusions run along
+# these lines (a beef farm and a dairy farm are both cattle sheds and yards from the air;
+# the three pig classes differ in scale more than in kind), so merging them asks whether
+# the models get the *kind* of farm right even when they miss the grade. A farm carries a
+# merged class if it carries any member; a model's score for it is the max over the
+# members it emits.
+CLASS_GROUPS = {
+    "cattle": ["beef", "dairy"],
+    "pigs": ["backyardpig", "commercialpig", "freerangepig"],
+}
+
+
+def merged_order() -> list[str]:
+    """ALL_CLASSES with each group standing where its first member stood."""
+    order = []
+    for name in ALL_CLASSES:
+        group = next((g for g, members in CLASS_GROUPS.items() if name in members), None)
+        label = group or name
+        if label not in order:
+            order.append(label)
+    return order
+
+
+def merge_truth(truth: pd.DataFrame) -> pd.DataFrame:
+    columns = {}
+    for name in merged_order():
+        members = CLASS_GROUPS.get(name, [name])
+        present = [m for m in members if m in truth.columns]
+        columns[name] = truth[present].to_numpy().any(axis=1) if present else np.zeros(len(truth), bool)
+    return pd.DataFrame(columns)
+
+
+def merge_model(model: dict) -> dict:
+    """The model over the merged vocabulary, scoring a group by its best member."""
+    classes, columns = [], []
+    for name in merged_order():
+        members = [m for m in CLASS_GROUPS.get(name, [name]) if column_of(model, m) is not None]
+        if not members:
+            continue
+        classes.append(name)
+        columns.append([column_of(model, m) for m in members])
+
+    def fold(matrix: np.ndarray) -> np.ndarray:
+        return np.column_stack([matrix[:, cols].max(axis=1) for cols in columns])
+
+    return {
+        **model,
+        "classes": classes,
+        "ensemble": fold(model["ensemble"]),
+        "seeds": [fold(seed) for seed in model["seeds"]],
+    }
+
 
 def decisions(model: dict, truth: pd.DataFrame, rule: str) -> tuple[np.ndarray, pd.DataFrame]:
     """Turn a model's scores into one yes/no per (unit, class), plus the operating points.
@@ -966,7 +1018,11 @@ def decisions(model: dict, truth: pd.DataFrame, rule: str) -> tuple[np.ndarray, 
 
 
 def confusion_sets(
-    truth: pd.DataFrame, model: dict, predicted: np.ndarray, extra_row: str
+    truth: pd.DataFrame,
+    model: dict,
+    predicted: np.ndarray,
+    extra_row: str,
+    order_of: list[str] = ALL_CLASSES,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Annotated classes (rows) against *every* predicted class (columns), as counts.
 
@@ -978,7 +1034,7 @@ def confusion_sets(
     nothing lands in the NOTHING_PREDICTED column; a unit annotated nothing in the
     `extra_row` row.
     """
-    present = [name for name in ALL_CLASSES if name in truth.columns and truth[name].any()]
+    present = [name for name in order_of if name in truth.columns and truth[name].any()]
     marks = truth[present].to_numpy()
     annotated, guessed = [], []
     for row in range(len(truth)):
@@ -1242,7 +1298,9 @@ def pair_table(pairs: pd.DataFrame, models: list[dict], level: str) -> str:
     )
 
 
-def pr_panels(truth: pd.DataFrame, models: list[dict], level: str) -> str:
+def pr_panels(
+    truth: pd.DataFrame, models: list[dict], level: str, order_of: list[str] = ALL_CLASSES
+) -> str:
     """Precision-recall behind each class's AP, faceted one panel per model.
 
     Faceted rather than overlaid on purpose: four categorical hues in one frame do not
@@ -1253,7 +1311,7 @@ def pr_panels(truth: pd.DataFrame, models: list[dict], level: str) -> str:
     scored = [m for m in models if m["ensemble"] is not None]
     classes = [
         c
-        for c in ALL_CLASSES
+        for c in order_of
         if c in truth.columns and truth[c].any() and any(column_of(m, c) is not None for m in scored)
     ]
     size, gap_x, gap_y = 128, 18, 40
@@ -2011,7 +2069,7 @@ code {
 .preds { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; font-size: 11.5px; }
 .verdict { display: flex; align-items: center; gap: 5px; white-space: nowrap; line-height: 1.4; }
 .verdict .key-line { width: 10px; }
-.verdict .vkey { color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px; width: 50px; flex: none; }
+.verdict .vkey { color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px; width: 64px; flex: none; }
 .verdict .vtop { font-weight: 600; }
 .verdict .vscore { color: var(--ink-2); font-variant-numeric: tabular-nums; }
 .verdict .vglyph { font-weight: 700; }
@@ -2215,7 +2273,7 @@ def agreement_card(agreement: pd.DataFrame, models: list[dict]) -> str:
     )
 
 
-def operating_table(operating: pd.DataFrame, models: list[dict]) -> str:
+def operating_table(operating: pd.DataFrame, models: list[dict], order_of: list[str] = ALL_CLASSES) -> str:
     """Per class and model: how many farms were predicted, how many were right, and the
     score that decision corresponds to. Precision and recall coincide at prevalence."""
     rows = operating[operating["positives"] > 0]
@@ -2232,7 +2290,7 @@ def operating_table(operating: pd.DataFrame, models: list[dict]) -> str:
         + "</tr>"
     )
     body = []
-    for name in [c for c in ALL_CLASSES if c in set(rows["class"])]:
+    for name in [c for c in order_of if c in set(rows["class"])]:
         cells = []
         for key in keys:
             entry = rows[(rows["class"] == name) & (rows["model"] == key)]
@@ -2541,6 +2599,7 @@ def build_page(
     aggregation: str,
     denominators: dict[str, dict[str, pd.Series]],
     operating: pd.DataFrame,
+    operating_merged: pd.DataFrame,
     farm_rule: str,
     gallery: str,
     reference: dict | None,
@@ -2569,6 +2628,9 @@ def build_page(
             f"<code>--farm-threshold prevalence</code> predicts each class for as many farms "
             f"as are annotated with it instead."
         )
+    merged_caption = "; ".join(
+        f"{group} = {' + '.join(members)}" for group, members in CLASS_GROUPS.items()
+    )
     ramp = "".join(f'<i style="background:var(--heat-{step})"></i>' for step in range(7))
     diag_key = '<div class="ramp diag-key"><i></i>annotated class is the top class</div>'
 
@@ -2724,6 +2786,17 @@ def build_page(
     </div>
     <div class="scroll">{pr_panels(truths["crop"], scored, "crop")}</div>
   </div>
+  <div class="card">
+    <div class="card-head"><h3>Precision-recall, crop level, common classes merged &mdash; {merged_caption}</h3>
+      <div class="legend"><span><i class="key-seed"></i>thin line = one seed run</span>
+      <span><i class="key-tick"></i>prevalence</span></div>
+    </div>
+    <p class="lede">The same curves over the merged vocabulary: a crop is a positive for a
+    merged class if it is annotated with any member, and a model&rsquo;s score for it is the
+    highest of the members it emits. The prevalence tick moves up accordingly, so compare each
+    curve with its own tick rather than with the panel above.</p>
+    <div class="scroll">{pr_panels(merge_truth(truths["crop"]), [merge_model(m) for m in scored], "crop", merged_order())}</div>
+  </div>
 </section>
 """,
         f"""
@@ -2761,6 +2834,21 @@ def build_page(
     </div>
     <div class="card-head"><h3>Operating points behind the farm-level panel</h3></div>
     {operating_table(operating, scored)}
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Farm level, common classes merged &mdash; {merged_caption}</h3>
+      <div class="ramp">less{ramp}more of the row</div>{diag_key}
+    </div>
+    <p class="lede">The same panel with the classes the labellers themselves confuse folded
+    together, to ask whether a model gets the <em>kind</em> of farm right when it misses the
+    grade. A farm carries a merged class if it carries any member, a model&rsquo;s score for
+    it is the highest of the members it emits, and the operating point is recomputed at the
+    merged prevalence. A farm annotated beef and dairy is one cattle farm here, not two rows.</p>
+    <div class="confusions">
+      {"".join(confusion_table(confusions["farm_merged"][m["key"]], m, denominators["farm_merged"][m["key"]]) for m in scored)}
+    </div>
+    <div class="card-head"><h3>Operating points, merged classes</h3></div>
+    {operating_table(operating_merged, scored, merged_order())}
   </div>
 </section>
 """,
@@ -3023,9 +3111,10 @@ def main() -> None:
 
     # Crop level stays against the single top class: only 17 crops carry two labels.
     # Farm level is set against set, at the operating point --farm-threshold names.
-    confusions = {"crop": {}, "farm": {}}
-    denominators = {"crop": {}, "farm": {}}
-    operating = []
+    confusions = {"crop": {}, "farm": {}, "farm_merged": {}}
+    denominators = {"crop": {}, "farm": {}, "farm_merged": {}}
+    operating, operating_merged = [], []
+    farm_merged = merge_truth(farm)
     for m in models:
         if m["ensemble"] is not None:
             confusions["crop"][m["key"]] = confusion(crop, m, "no class marked")
@@ -3037,8 +3126,16 @@ def main() -> None:
         confusions["farm"][m["key"]], denominators["farm"][m["key"]] = confusion_sets(
             farm, m, predicted, "no class marked"
         )
+        coarse = merge_model(m)
+        predicted, points = decisions(coarse, farm_merged, farm_rule)
+        operating_merged.append(points)
+        confusions["farm_merged"][m["key"]], denominators["farm_merged"][m["key"]] = confusion_sets(
+            farm_merged, coarse, predicted, "no class marked", merged_order()
+        )
     operating = pd.concat(operating, ignore_index=True)
     operating.insert(0, "rule", farm_rule)
+    operating_merged = pd.concat(operating_merged, ignore_index=True)
+    operating_merged.insert(0, "rule", farm_rule)
 
     # ---- console summary -------------------------------------------------------------
     for level in LEVELS:
@@ -3082,6 +3179,7 @@ def main() -> None:
             args.output / f"confusion_{level}.csv"
         )
     operating.to_csv(args.output / "operating_points_farm.csv", index=False)
+    operating_merged.to_csv(args.output / "operating_points_farm_merged.csv", index=False)
 
     pd.DataFrame(
         [
@@ -3187,6 +3285,7 @@ def main() -> None:
             args.aggregation,
             denominators,
             operating,
+            operating_merged,
             farm_rule,
             gallery,
             reference,
