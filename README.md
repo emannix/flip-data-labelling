@@ -482,6 +482,92 @@ merged into `cattle` and the three pig classes into `pigs` (`CLASS_GROUPS` in th
 script), writing `confusion_farm_merged.csv` and `operating_points_farm_merged.csv`.
 
 
+# adding SAM3 structure detections
+
+The dataset builder's `sam3_pipeline.py` ran SAM3, text-prompted instance segmentation,
+over every building crop of the two builder releases the master draws on and left one row
+per crop in `flip-geoimage-dataset-builder/sam3_results/{training,generalisation}/
+sam3_detections.csv`: per prompt, how many objects it found, their mean and total area in
+square metres and the strongest detection score. Five prompts are a building gate (`roof`,
+`building`, `shed`, `shelter`, `house`), five are class features that all but never fire
+on a paddock (`water tank`, `silo`, `vehicle`, `cattle yard`, `pond`). Two scripts bring
+that into this repository.
+
+## `gen_sam3_postprocess_relabel.py` — the `sam3_*.csv` files
+
+    .venv/bin/python gen_sam3_postprocess_relabel.py
+
+For every csv in `original_master_2026_09_04/` this writes a `sam3_`-prefixed copy beside
+it — `sam3_train_df.csv` is `train_df.csv` plus SAM3 columns, same rows in the same order
+— and a `sam3_README.md` tallying the join. The originals are not touched. The join is on
+the crop's own relative path, so every `autocrops` and `generalisation` row lands and the
+`historical` whole-farm photographs, which were never cut into crops, come through with
+`sam3_available = False` and empty SAM3 columns.
+
+It also relabels. 98 % of the master's training labels are farm-level, so a dairy's nine
+paddocks are all "dairy", which the 2026-09-04 evaluation names as the mechanism by which
+the master models lose paddock. Checked on the 1,629 human-labelled crops, "no gate
+detection" picks out paddock with precision 0.96 and recall 0.83, so every *farm-level*
+crop with no building detected is relabelled `paddock` — 7,761 of the 17,927 training
+crops, 1,849 of the 4,320 validation crops, 592 of `test_autocrops` — and every
+human-labelled crop is left as it was. The original label stays on the row in
+`crop_classes_pre_sam3` / `processed_class_pre_sam3` / `n_classes_pre_sam3`,
+`sam3_relabel` marks what changed and `binary_*` is recomputed, so it can be undone column
+by column. `--no-relabel` attaches the features and changes nothing; `--gate-min-score`
+(default 0.5, the pipeline's own detection threshold) moves the bar.
+
+Columns, all prefixed `sam3_`: the pipeline's `{prompt}_{count,mean_area_m2,
+total_area_m2,max_score}`, a `{prompt}_area_frac` normalised by the crop's area so crops of
+different sizes and resolutions compare, the crop's size and resolution, and the gate
+summaries `gate_score`, `gate_count`, `gate_area_frac` and the boolean `building`.
+
+## `gen_post_classifier.py` — post-classifiers on top of the scored models
+
+    .venv/bin/python gen_post_classifier.py
+    .venv/bin/python gen_post_classifier.py --base comfe_m lin_m cascade_p --cv-repeats 5
+
+Reads the `sam3_*.csv` files and the per-crop scores `gen_evaluation_2026_09_04.py`
+wrote to `output_eval_2026_09_04/scores_crop.csv`, and derives three models per `--base`
+(default the master ComFe and the linear-probe-gated cascade) without a GPU:
+
+- `gate_<base>` — no fitting. Livestock scores times SAM3's building score, paddock one
+  minus it. The SAM3 twin of the evaluation's cascades, which gate on a 2026-08-21 model.
+- `sam3_prior` — SAM3 features only, one gradient-boosted classifier per class fitted on
+  `sam3_train_df.csv` (never VIC). What the detections alone can say.
+- `post_<base>` / `postcv_<base>` — a logistic stacker per class over the base's scores
+  for every class, the SAM3 features and the prior. `postcv_` is fitted on the hold-out
+  under farm-grouped stratified 5-fold cross-validation, repeated `--cv-repeats` times as
+  seeds, and scored out of fold; `post_` is fitted on the validation split, which is out
+  of region for VIC, and needs per-crop scores on `val_df.csv` that the training runs did
+  not save.
+- `xgb_<base>` / `xgbcv_<base>` — the same stacker with gradient-boosted trees (xgboost,
+  shallow, positives up-weighted) in place of the logistic regression, so an interaction
+  between a model score and a detection can be learned. `--stacker {logistic,xgboost,both}`
+  chooses; the default is both, side by side. Produce them with the builder's `*_predict_percrop.yaml` config pointed at
+  `val_df.csv` (`group_pool: null`, so the saved index is the csv's row order), drop the
+  runs under `comfe-run-flip/view/flip_2026_09_04_percrop/` (or `--split-runs`), and
+  `--fit-on auto` picks them up; `--fit-on both` reports both fits side by side.
+
+Everything is scored with the evaluation script's own functions — same hold-out, same
+bootstrap, crop and farm level — and written to `output_post_classifier_2026_09_04/` in
+the same layouts (`evaluation.csv`, `evaluation_pairs.csv`, `evaluation_by_region.csv`,
+`agreement.csv`, `scores_{crop,farm}.csv`, `models.csv`) plus `stacker_coefficients.csv`,
+which says what each stacker leans on (signed standardised coefficients for the logistic
+stacker, gain importances for xgboost), and `stacker_fits.csv`. Classes with fewer than
+`--min-positives` positives in the fitting data pass the base through unchanged. The
+console table prints, per class, the base, its derivatives and the paired bootstrap
+difference of the stacker against the base.
+
+First pass, cross-validated on the hold-out, crop level: the gate alone lifts paddock AP
+from 0.56 (master ComFe) to 0.96, above the linear probe's 0.95; the stacker on the master
+ComFe is clear of zero on beef (+0.10), residential (+0.25), other_industrial (+0.10) and
+paddock (+0.41), and takes the well-sampled macro from 0.25 to 0.32. The xgboost stacker
+lands in the same place (macro 0.32) with a larger residential gain (+0.34) and
+other_industrial (+0.19) but no beef gain to speak of, and is weaker at farm level (macro
+0.41 against the logistic stacker's 0.43). The coefficients read sensibly — houses and
+vehicles argue for residential, sheds against — but the CV folds are small and
+in-region, so treat it as a ceiling until the val-fitted stacker exists.
+
 # Notes from next
 
 Out of distribution stuff
