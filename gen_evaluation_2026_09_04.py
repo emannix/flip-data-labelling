@@ -29,6 +29,14 @@ per annotated class to span the newest ComFe's confidence - its highest-, median
 lowest-scoring farm for that class - so the gallery shows misses as well as hits and is
 not free to flatter the model it is picked on.
 
+*Two derived cascades.* The two multilabel ComFe models fail in opposite places - the
+2026-08-21 one cannot tell dairy from horse, the master one reads a paddock as a sheep
+farm - so two more models are built from saved scores without any retraining: the master
+ComFe's livestock scores, multiplied by a 2026-08-21 model's probability that the crop is
+a building at all, with paddock and other_industrial passed through from the 2026-08-21
+generation. One gates on ComFe's paddock and other_industrial, the other on the linear
+probe's paddock alone. They are scored like every other model and have their own section.
+
 Everything about thin classes, paired bootstraps and pending runs in the 2026-08-21
 script still applies.
 
@@ -240,6 +248,49 @@ MODELS = [
     },
 ]
 
+# The cascades: models derived from two of the six, with no training of their own.
+#
+#   b(x)     = 1 - max over c in gate_classes of gate[c](x)       the crop is a building
+#   s_c(x)   = comfe_m[c](x) * b(x)                               c a livestock class
+#   s_c(x)   = passthrough[c][c](x)                               c in {paddock, other_industrial}
+#   S_c(F)   = max over crops x of farm F of s_c(x)               farm level, as for every model
+#
+# The gate is a 2026-08-21 model's belief that the crop is a building, which is the one
+# thing that generation does well (paddock AP 0.93 for ComFe, 0.95 for the linear probe,
+# out of region); the livestock ranking is the master ComFe's, which is the one thing
+# *it* does well. Two cascades are tried. The first gates on ComFe's paddock and
+# other_industrial together; the 2026-08-21 ComFe reads pig and beef infrastructure as
+# industrial, so that gate costs those classes. The second gates on paddock alone, taken
+# from the linear probe since it is the better paddock detector, and keeps ComFe's
+# other_industrial as the pass-through output because the probe's is worse. Seed runs are
+# paired index-wise, so a cascade has as many seeds as the shortest of its parents; its
+# ensemble is built from the parents' ensembles, not the mean of the seed products.
+CASCADES = [
+    {
+        "key": "cascade",
+        "slot": 7,
+        "label": "Cascade, ComFe paddock + industrial gate (derived)",
+        "detail": "comfe_m livestock x (1 - max(comfe paddock, comfe other_industrial)); paddock and other_industrial from comfe",
+        "gate": "comfe",
+        "gate_classes": ["paddock", "other_industrial"],
+        "livestock": "comfe_m",
+        "passthrough": {"paddock": "comfe", "other_industrial": "comfe"},
+        "classes": MASTER_CLASSES,
+    },
+    {
+        "key": "cascade_p",
+        "slot": 8,
+        "label": "Cascade, linear-probe paddock gate (derived)",
+        "detail": "comfe_m livestock x (1 - lin paddock); paddock from lin, other_industrial from comfe",
+        "gate": "lin",
+        "gate_classes": ["paddock"],
+        "livestock": "comfe_m",
+        "passthrough": {"paddock": "lin", "other_industrial": "comfe"},
+        "classes": MASTER_CLASSES,
+    },
+]
+CASCADE = CASCADES[0]
+
 # The model the farm gallery is selected against: the newest ComFe, or whichever of the
 # master pair has landed.
 REFERENCE_KEYS = ["comfe_m", "lin_m", "comfe", "lin"]
@@ -396,6 +447,57 @@ def scores_for(model: dict, name: str, matrix: np.ndarray | None = None) -> np.n
         return None
     source = model["ensemble"] if matrix is None else matrix
     return source[:, position]
+
+
+def cascade_model(models: list[dict], spec: dict) -> dict | None:
+    """The derived cascade `spec`, or None while any parent is missing."""
+    parents = {m["key"]: m for m in models if m["ensemble"] is not None}
+    # Every model the cascade draws on, in a stable order, each used once.
+    needed = list(dict.fromkeys(
+        [spec["gate"], spec["livestock"]] + [spec["passthrough"][c] for c in NEW_ONLY_CLASSES]
+    ))
+    if any(key not in parents for key in needed):
+        return None
+    gate, live = parents[spec["gate"]], parents[spec["livestock"]]
+    for name in spec["gate_classes"]:
+        if column_of(gate, name) is None:
+            raise SystemExit(f"{spec['key']}: gate model {gate['key']} has no {name} output")
+    for name in NEW_ONLY_CLASSES:
+        if column_of(parents[spec["passthrough"][name]], name) is None:
+            raise SystemExit(f"{spec['key']}: {spec['passthrough'][name]} has no {name} output")
+
+    def combine(scores: dict[str, np.ndarray]) -> np.ndarray:
+        """One cascade score matrix from one score matrix per parent."""
+        building = 1.0 - np.max(
+            [scores[gate["key"]][:, column_of(gate, name)] for name in spec["gate_classes"]],
+            axis=0,
+        )
+        out = np.empty((len(building), len(spec["classes"])))
+        for j, name in enumerate(spec["classes"]):
+            if name in NEW_ONLY_CLASSES:
+                source = parents[spec["passthrough"][name]]
+                out[:, j] = scores[source["key"]][:, column_of(source, name)]
+            else:
+                out[:, j] = scores[live["key"]][:, column_of(live, name)] * building
+        return out
+
+    n_seeds = min(len(parents[key]["seeds"]) for key in needed)
+    return {
+        **spec,
+        "space": "test",
+        "runs": "derived from " + ", ".join(needed),
+        "match": None,
+        "seeds": [
+            combine({key: parents[key]["seeds"][i] for key in needed}) for i in range(n_seeds)
+        ],
+        "seed_labels": [
+            "x".join(parents[key]["seed_labels"][i] for key in needed) for i in range(n_seeds)
+        ],
+        "ensemble": combine({key: parents[key]["ensemble"] for key in needed}),
+        "n_found": n_seeds,
+        "n_pending": 0,
+        "pending_names": [],
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -816,14 +918,100 @@ def confusion(truth: pd.DataFrame, model: dict, extra_row: str) -> pd.DataFrame:
     return table.reindex(index=order, columns=model["classes"], fill_value=0)
 
 
+NOTHING_PREDICTED = "nothing predicted"
+
+
+def decisions(model: dict, truth: pd.DataFrame, rule: str) -> tuple[np.ndarray, pd.DataFrame]:
+    """Turn a model's scores into one yes/no per (unit, class), plus the operating points.
+
+    `rule` is either `"prevalence"` or a number. At prevalence, a class is predicted for
+    the k highest-scoring units where k is the number of units annotated with it - the
+    operating point where predicted and annotated counts agree, so precision equals
+    recall (up to ties) and the diagonal of the confusion reads as recall. It is the only
+    rule that is fair across these models, whose scores sit on very different scales:
+    the master ComFe's top score on a farm is often under 0.05. A numeric rule predicts
+    every class whose score exceeds it, which is what a deployment would do, and is there
+    to show what that costs. A class with no annotated unit at all is never predicted at
+    prevalence; under a numeric rule it is predicted like any other.
+    """
+    scores = model["ensemble"]
+    predicted = np.zeros(scores.shape, dtype=bool)
+    rows = []
+    for j, name in enumerate(model["classes"]):
+        column = scores[:, j]
+        positives = int(truth[name].sum()) if name in truth.columns else 0
+        if rule == "prevalence":
+            k = positives
+            if k:
+                predicted[np.argsort(-column, kind="stable")[:k], j] = True
+            threshold = float(np.sort(column)[::-1][k - 1]) if k else np.nan
+        else:
+            threshold = float(rule)
+            predicted[:, j] = column > threshold
+        n_predicted = int(predicted[:, j].sum())
+        hits = int((predicted[:, j] & truth[name].to_numpy()).sum()) if name in truth.columns else 0
+        rows.append(
+            {
+                "model": model["key"],
+                "class": name,
+                "positives": positives,
+                "predicted": n_predicted,
+                "true_positives": hits,
+                "threshold": threshold,
+                "precision": hits / n_predicted if n_predicted else np.nan,
+                "recall": hits / positives if positives else np.nan,
+            }
+        )
+    return predicted, pd.DataFrame(rows)
+
+
+def confusion_sets(
+    truth: pd.DataFrame, model: dict, predicted: np.ndarray, extra_row: str
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Annotated classes (rows) against *every* predicted class (columns), as counts.
+
+    Both sides are sets: a farm annotated dairy and horse that is predicted dairy and
+    residential contributes to (dairy, dairy), (dairy, residential), (horse, dairy) and
+    (horse, residential). So the diagonal is the true positives for the row's class, and
+    with the row's denominator being the number of units annotated with that class - the
+    second return value - the diagonal's row fraction is exactly recall. A unit predicted
+    nothing lands in the NOTHING_PREDICTED column; a unit annotated nothing in the
+    `extra_row` row.
+    """
+    present = [name for name in ALL_CLASSES if name in truth.columns and truth[name].any()]
+    marks = truth[present].to_numpy()
+    annotated, guessed = [], []
+    for row in range(len(truth)):
+        names = [name for name, flag in zip(present, marks[row]) if flag] or [extra_row]
+        picks = [name for name, flag in zip(model["classes"], predicted[row]) if flag] or [
+            NOTHING_PREDICTED
+        ]
+        for a in names:
+            for p in picks:
+                annotated.append(a)
+                guessed.append(p)
+    order = [name for name in present if name in set(annotated)]
+    if extra_row in set(annotated):
+        order.append(extra_row)
+    table = pd.crosstab(
+        pd.Series(annotated, name="annotated"), pd.Series(guessed, name="predicted")
+    ).reindex(index=order, columns=model["classes"] + [NOTHING_PREDICTED], fill_value=0)
+    denominators = pd.Series(
+        {name: int(truth[name].sum()) if name != extra_row else int((~marks.any(axis=1)).sum())
+         for name in order}
+    )
+    return table, denominators
+
+
 # --------------------------------------------------------------------------------------
 # dashboard: palette and svg helpers
 # --------------------------------------------------------------------------------------
 
-# Categorical slots 1-6 of the validated reference palette, used unchanged and in its
-# fixed order; light value first, dark second. The four older families keep the slots
-# they had on the 2026-08-21 dashboard, so a colour still names the same model across
-# the two pages, and the master pair take slots 5 and 6. The documented order clears
+# All eight categorical slots of the validated reference palette, used unchanged and in
+# their fixed order; light value first, dark second. The four older families keep the
+# slots they had on the 2026-08-21 dashboard, so a colour still names the same model
+# across the two pages, the master pair take slots 5 and 6, and the two derived cascades
+# slots 7 and 8. The documented order clears
 # every hard gate on the *adjacent* pairlist that grouped bars and dot rows sit on
 # (worst adjacent CVD dE 9.1 light / 8.4 dark against a target of 8; worst normal-vision
 # dE 19.6 / 19.3 against a floor of 15). It does NOT clear the all-pairs pairlist -
@@ -841,6 +1029,8 @@ SERIES = {
     "comfe": ("#eda100", "#c98500"),
     "lin_m": ("#e87ba4", "#d55181"),
     "comfe_m": ("#008300", "#008300"),
+    "cascade": ("#4a3aa7", "#9085e9"),
+    "cascade_p": ("#e34948", "#e66767"),
 }
 # Diverging blue-red with a neutral grey midpoint, for the paired differences.
 DIVERGING = {"up": ("#2a78d6", "#3987e5"), "down": ("#d03b3b", "#e66767")}
@@ -1249,9 +1439,13 @@ def curve_points(y_true: np.ndarray, y_score: np.ndarray, x0: float, y0: float, 
     )
 
 
-def confusion_table(counts: pd.DataFrame, model: dict) -> str:
-    """Row-normalised confusion heatmap as a real table, so it reads without the colour."""
-    totals = counts.sum(axis=1)
+def confusion_table(counts: pd.DataFrame, model: dict, denominators: pd.Series | None = None) -> str:
+    """Row-normalised confusion heatmap as a real table, so it reads without the colour.
+
+    `denominators` are the row totals to shade against when the columns are set-valued
+    and a unit can appear in several of them; without them the row sum is used.
+    """
+    totals = counts.sum(axis=1) if denominators is None else denominators
     head = "".join(f"<th><span>{escape(column)}</span></th>" for column in counts.columns)
     body = []
     for name, row in counts.iterrows():
@@ -1297,6 +1491,10 @@ JPEG_QUALITY = 70
 # Farms per annotated class in the gallery, and the fewest crops a farm needs to be
 # worth a card - a one-crop farm shows nothing the per-class charts do not.
 EXAMPLES_PER_CLASS = 3
+# Per class, the farms *not* annotated with it that the models collectively rank highest
+# for it - the shared false alarms. Ranked on mean rank percentile across models rather
+# than mean score, since the models' scores are not on a common scale.
+EXAMPLES_CONFUSED = 2
 EXAMPLE_MIN_CROPS = 2
 NO_LABEL = "no farm label"
 
@@ -1322,28 +1520,37 @@ def livestock_classes(model: dict) -> list[str]:
 
 
 def choose_examples(
-    farms: pd.DataFrame, truth: pd.DataFrame, reference: dict
+    farms: pd.DataFrame, truth: pd.DataFrame, reference: dict, farm_models: list[dict]
 ) -> tuple[list[dict], dict[int, list[str]]]:
     """Which farms the gallery shows, and why each is there.
 
     Per annotated class, up to EXAMPLES_PER_CLASS farms carrying it: the one the
     reference model scores highest for that class at farm level, the median one and the
-    lowest, among farms with at least EXAMPLE_MIN_CROPS crops. Then the same spread over
-    farms with no livestock annotation at all, ranked on the reference model's highest
-    livestock score - the top of that list is its loudest false alarm, the bottom a clean
-    read. Spanning the score rather than sampling it guarantees a miss beside every hit,
-    so the gallery cannot flatter the model it is picked on. A farm qualifying under more
-    than one class is shown once, in its first group, carrying every reason.
+    lowest, among farms with at least EXAMPLE_MIN_CROPS crops. Then up to
+    EXAMPLES_CONFUSED farms *not* carrying the class that the models collectively rank
+    highest for it - each model's farm-level score is turned into a rank percentile
+    over the eligible farms and the percentiles are averaged across every model that
+    emits the class, so a farm every model mistakes for a dairy outranks one that only
+    the loudest model does. Then the same highest/median/lowest spread over farms with no
+    livestock annotation at all, on the reference model's highest livestock score. The
+    spread guarantees a miss beside every hit and the confused farms show the shared
+    false alarms, so the gallery cannot flatter the model it is picked on. A farm
+    qualifying more than once is shown once, in its first group, carrying every reason.
     """
     eligible = farms["n_crops"].to_numpy() >= EXAMPLE_MIN_CROPS
     key = reference["key"]
+    scored = [m for m in farm_models if m["ensemble"] is not None]
     groups: list[dict] = []
     reasons: dict[int, list[str]] = {}
 
-    def pick(mask: np.ndarray, ranking: np.ndarray, title: str, what: str) -> None:
+    def annotated(index: int) -> str:
+        marked = [c for c in truth.columns if truth.at[index, c]]
+        return ", ".join(marked) if marked else NO_LABEL
+
+    def pick(mask: np.ndarray, ranking: np.ndarray, title: str, what: str) -> list[int]:
         candidates = np.flatnonzero(mask & eligible)
         if not len(candidates):
-            return
+            return []
         order = candidates[np.argsort(-ranking[candidates], kind="stable")]
         slots = [(0, "highest"), (len(order) // 2, "median"), (len(order) - 1, "lowest")]
         members = []
@@ -1355,12 +1562,39 @@ def choose_examples(
             members.append(index)
             reasons.setdefault(index, []).append(reason)
         groups.append({"title": title, "members": members, "n_candidates": int(len(order))})
+        return members
+
+    def confused(name: str, members: list[int]) -> None:
+        """The farms without `name` that the models, together, rank highest for it."""
+        emitting = [m for m in scored if column_of(m, name) is not None]
+        if not emitting:
+            return
+        percentiles = np.mean(
+            [
+                pd.Series(np.where(eligible, scores_for(m, name), np.nan)).rank(pct=True).to_numpy()
+                for m in emitting
+            ],
+            axis=0,
+        )
+        negatives = np.flatnonzero(~truth[name].to_numpy() & eligible)
+        order = negatives[np.argsort(-percentiles[negatives], kind="stable")]
+        for index in order[:EXAMPLES_CONFUSED]:
+            index = int(index)
+            reasons.setdefault(index, []).append(
+                f"confused as {name} by the models together (mean rank percentile "
+                f"{percentiles[index]:.2f} over {len(emitting)} models), annotated {annotated(index)}"
+            )
+            if index not in members:
+                members.append(index)
 
     livestock = [c for c in livestock_classes(reference) if c in truth.columns]
     for name in SHARED_CLASSES + LEGACY_ONLY_CLASSES:
         if name not in truth.columns or column_of(reference, name) is None:
             continue
-        pick(truth[name].to_numpy(), scores_for(reference, name), name, name)
+        if not truth[name].any():
+            continue
+        members = pick(truth[name].to_numpy(), scores_for(reference, name), name, name)
+        confused(name, members)
 
     unlabelled = ~truth[livestock].to_numpy().any(axis=1)
     loudest = np.column_stack([scores_for(reference, c) for c in livestock]).max(axis=1)
@@ -1477,7 +1711,7 @@ def farm_card(
         f'<span class="muted">{escape(region)} &middot; PFI {escape(farm["PFI"])} &middot; '
         f'{len(rows)} crops</span></h4>'
         f'<p class="farm-truth">annotated <b>{escape(", ".join(labels) or NO_LABEL)}</b></p>'
-        f'<p class="farm-why">shown as the {escape("; ".join(reasons))}</p></div>'
+        f'<p class="farm-why">why: {escape("; ".join(reasons))}</p></div>'
         f'<div class="farm-body">{figure}'
         f'<div class="farm-verdicts"><p class="tile-label">farm level, top livestock class</p>'
         f'<ul class="preds">{verdicts}</ul></div></div>'
@@ -1692,6 +1926,18 @@ table { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size
 .rowcount { color: var(--muted); font-size: 11px; margin-left: 8px; font-weight: 400; }
 
 .pairs td { text-align: center; line-height: 1.3; }
+.cascade-table td { text-align: right; }
+.equation {
+  display: flex; flex-direction: column; gap: 6px; font-size: 14px; padding: 12px 18px;
+  background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; max-width: 78ch;
+  font-variant-numeric: tabular-nums;
+}
+.equation var { font-style: italic; font-family: "Times New Roman", Georgia, serif; font-size: 15px; }
+.equation sub { font-size: 0.72em; }
+.equation .eq-lhs { display: inline-block; min-width: 3.6em; text-align: right; margin-right: 4px; }
+.equation .eq-note { display: block; margin-left: 5.2em; font-size: 12px; color: var(--muted); }
+@media (min-width: 700px) { .equation .eq-note { display: inline; margin-left: 18px; } }
+.cascade-table td.delta-cell { text-align: center; }
 .pairs .pairhead { display: inline-block; font-size: 11px; line-height: 1.4; }
 .pairs .pairhead .key-line { vertical-align: middle; margin: 0 2px; }
 .delta-cell { background: color-mix(in srgb, var(--tint-color) calc(var(--tint) * 42%), transparent); }
@@ -1717,7 +1963,11 @@ table { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size
   background: var(--heat-0); border: 2px solid var(--surface); border-radius: 3px;
 }
 .heat .cell-flip { color: var(--heat-ink-flip); }
-.heat .diag { outline: 1.5px solid var(--axis); outline-offset: -2px; }
+/* The true-positive diagonal: annotated class is the top class. Red, and a shape (the
+   outline) as well as a colour, so it reads on every heat step in both themes. */
+.heat .diag { outline: 2px solid var(--pole-down); outline-offset: -2px; }
+.diag-key { display: flex; align-items: center; gap: 6px; }
+.diag-key i { width: 14px; height: 14px; border-radius: 3px; display: inline-block; box-sizing: border-box; border: 2px solid var(--pole-down); }
 .heat .cell[style*="--step:1"] { background: var(--heat-1); }
 .heat .cell[style*="--step:2"] { background: var(--heat-2); }
 .heat .cell[style*="--step:3"] { background: var(--heat-3); }
@@ -1965,6 +2215,130 @@ def agreement_card(agreement: pd.DataFrame, models: list[dict]) -> str:
     )
 
 
+def operating_table(operating: pd.DataFrame, models: list[dict]) -> str:
+    """Per class and model: how many farms were predicted, how many were right, and the
+    score that decision corresponds to. Precision and recall coincide at prevalence."""
+    rows = operating[operating["positives"] > 0]
+    if rows.empty:
+        return ""
+    keys = [m["key"] for m in models if m["key"] in set(rows["model"])]
+    head = (
+        "<tr><th>class</th><th>farms annotated</th>"
+        + "".join(
+            f'<th><i class="key-line" style="background:var(--series-{k})"></i>{escape(k)}<br>'
+            f'<span class="muted">right / predicted &middot; score cut</span></th>'
+            for k in keys
+        )
+        + "</tr>"
+    )
+    body = []
+    for name in [c for c in ALL_CLASSES if c in set(rows["class"])]:
+        cells = []
+        for key in keys:
+            entry = rows[(rows["class"] == name) & (rows["model"] == key)]
+            if entry.empty:
+                cells.append('<td class="muted">no output</td>')
+                continue
+            e = entry.iloc[0]
+            cut = "" if pd.isna(e["threshold"]) else f' <span class="muted">&middot; {e["threshold"]:.3f}</span>'
+            cells.append(f'<td>{int(e["true_positives"])} / {int(e["predicted"])}{cut}</td>')
+        positives = int(rows[rows["class"] == name].iloc[0]["positives"])
+        body.append(f'<tr><th scope="row">{escape(name)}</th><td>{positives}</td>{"".join(cells)}</tr>')
+    return (
+        f'<div class="scroll"><table class="data"><thead>{head}</thead>'
+        f"<tbody>{''.join(body)}</tbody></table></div>"
+        f'<p class="table-note"><b>right / predicted</b> is true positives over farms predicted '
+        f'with the class; the <b>score cut</b> is the lowest score that was still predicted. '
+        f'At prevalence the number predicted equals the number annotated, so right / predicted '
+        f'is both precision and recall.</p>'
+    )
+
+
+def cascade_card(metrics: pd.DataFrame, pairs: pd.DataFrame, models: list[dict], level: str) -> str:
+    """The cascade beside its two parents, class by class, with the paired differences.
+
+    Two difference columns: cascade minus the master ComFe says what the gate bought,
+    cascade minus the 2026-08-21 ComFe says whether the whole construction beats the
+    model that was already best at crop level. Both are paired on the same bootstrap
+    resamples as everything else on the page.
+    """
+    by_key = {m["key"]: m for m in models if m["ensemble"] is not None}
+    cascades = [c["key"] for c in CASCADES if c["key"] in by_key]
+    if not cascades:
+        return '<p class="lede">The cascades need both <code>comfe</code> and <code>comfe_m</code> to have landed.</p>'
+    keys = [CASCADE["gate"], CASCADE["livestock"]] + cascades
+    rows = metrics[metrics["level"] == level]
+    deltas = pairs[pairs["level"] == level]
+    # (later, earlier): later minus earlier, in slot order as the pairs table has them.
+    contrasts = [(c, CASCADE["livestock"]) for c in cascades] + [
+        (cascades[1], cascades[0])
+    ] * (len(cascades) > 1)
+
+    def delta_cell(name: str, later: str, earlier: str) -> str:
+        entry = deltas[(deltas["class"] == name) & (deltas["b"] == later) & (deltas["a"] == earlier)]
+        if entry.empty:
+            return '<td class="muted na">&mdash;</td>'
+        value = entry.iloc[0]
+        delta = float(value["delta_AP"])
+        strength = min(abs(delta) / 0.30, 1.0)
+        pole = "up" if delta >= 0 else "down"
+        bounds = (
+            ""
+            if pd.isna(value["delta_lo"])
+            else f'<br><span class="muted">[{value["delta_lo"]:+.2f}, {value["delta_hi"]:+.2f}]</span>'
+        )
+        mark = ' <span class="clear">&#9679;</span>' if value["clear_of_zero"] else ""
+        return (
+            f'<td class="delta-cell" style="--tint:{strength:.3f}" data-pole="{pole}">'
+            f'<span class="delta-value">{delta:+.3f}{mark}</span>{bounds}</td>'
+        )
+
+    head = (
+        "<tr><th>class</th><th>positives</th>"
+        + "".join(
+            f'<th><i class="key-line" style="background:var(--series-{k})"></i>AP {escape(k)}</th>'
+            for k in keys
+        )
+        + "".join(f"<th>{escape(later)} &minus; {escape(earlier)}</th>" for later, earlier in contrasts)
+        + "</tr>"
+    )
+    body = []
+    names = [c for c in SHARED_CLASSES + NEW_ONLY_CLASSES if c in set(rows["class"])]
+    names += [MACRO_SAMPLED, MACRO_SHARED]
+    for name in names:
+        row = rows[rows["class"] == name]
+        if row.empty:
+            continue
+        row = row.iloc[0]
+        cells = []
+        for k in keys:
+            value = row.get(f"{k}|AP")
+            cells.append(
+                f'<td class="muted">{escape(row.get(f"{k}|status") or "-")}</td>'
+                if pd.isna(value)
+                else f"<td>{value:.3f}</td>"
+            )
+        classes = []
+        if str(name).startswith("MACRO"):
+            classes.append("total")
+            if name == MACRO_SAMPLED:
+                classes.append("headline")
+        elif not row.get("well_sampled", True):
+            classes.append("starved")
+        emphasis = f' class="{" ".join(classes)}"' if classes else ""
+        positives = "" if pd.isna(row.get("positives")) else int(row["positives"])
+        body.append(
+            f'<tr{emphasis}><th scope="row">{escape(name)}</th><td>{positives}</td>'
+            + "".join(cells)
+            + "".join(delta_cell(name, later, earlier) for later, earlier in contrasts)
+            + "</tr>"
+        )
+    return (
+        f'<div class="scroll"><table class="data pairs cascade-table"><thead>{head}</thead>'
+        f"<tbody>{''.join(body)}</tbody></table></div>"
+    )
+
+
 def metrics_table(metrics: pd.DataFrame, models: list[dict], level: str) -> str:
     rows = metrics[metrics["level"] == level]
     scored = [m for m in models if m["ensemble"] is not None]
@@ -2165,6 +2539,9 @@ def build_page(
     n_crops: int,
     n_farms: int,
     aggregation: str,
+    denominators: dict[str, dict[str, pd.Series]],
+    operating: pd.DataFrame,
+    farm_rule: str,
     gallery: str,
     reference: dict | None,
     n_master_train: int,
@@ -2172,7 +2549,28 @@ def build_page(
 ) -> str:
     scored = [m for m in models if m["ensemble"] is not None]
     waiting = [m for m in models if m["ensemble"] is None or m["n_pending"]]
+    if farm_rule == "prevalence":
+        rule_note = (
+            "A class is predicted for a farm when the farm is among the <em>k</em> "
+            "highest-scoring farms for that class, with <em>k</em> the number of farms "
+            "annotated with it &mdash; the operating point at prevalence, where predicted and "
+            "annotated counts agree and precision equals recall. It is the only rule that is "
+            "fair across models whose scores sit on such different scales (the master "
+            "ComFe&rsquo;s top score on a farm is often under 0.05), and it means a class "
+            "no farm is annotated with, such as <code>paddock</code>, is never predicted. "
+            "Rerun with <code>--farm-threshold 0.5</code> to see a fixed score cut instead."
+        )
+    else:
+        rule_note = (
+            f"A class is predicted for a farm when its score exceeds {escape(farm_rule)}, "
+            f"whatever the class or model &mdash; what a deployment with a single threshold "
+            f"would do. The models&rsquo; scores are not on a common scale, so read the "
+            f"operating-point table underneath before comparing panels; the default "
+            f"<code>--farm-threshold prevalence</code> predicts each class for as many farms "
+            f"as are annotated with it instead."
+        )
     ramp = "".join(f'<i style="background:var(--heat-{step})"></i>' for step in range(7))
+    diag_key = '<div class="ramp diag-key"><i></i>annotated class is the top class</div>'
 
     banner = ""
     if waiting:
@@ -2195,8 +2593,8 @@ def build_page(
   <p class="eyebrow">Master build retrain &middot; VIC hold-out &middot;
   {escape(n_crops)} crops &middot; {escape(n_farms)} farms</p>
   <h1>Does training on the master build help on reaches no model has seen?</h1>
-  <p class="standfirst">Six checkpoints scored against the hand-relabelled crop labels of the
-  VIC hold-out. The four older families and the test crops are exactly those of the
+  <p class="standfirst">Six checkpoints and two derived cascades scored against the
+  hand-relabelled crop labels of the VIC hold-out. The four older families and the test crops are exactly those of the
   2026-08-21 dashboard, so their numbers repeat here unchanged. The two new families retrain
   the same architectures on <code>original_master_2026_09_04/train_df.csv</code>:
   {escape(f"{n_master_train:,}")} crops against the {escape(n_gen_train)} the 2026-08-21
@@ -2204,14 +2602,51 @@ def build_page(
   are autocrops and historical images carrying their farm&rsquo;s class on every building,
   so a paddock on a dairy farm was trained as <code>dairy</code>. Average precision by class,
   because the classes are rare and every model emits a ranking rather than a decision. The
-  page ends with real farms from the hold-out, every crop pictured with each model&rsquo;s
-  call.</p>
+  cascades multiply the master ComFe&rsquo;s livestock scores by the 2026-08-21
+  ComFe&rsquo;s belief that the crop is a building at all, since each of those two fails
+  where the other does not; they cost no training. The page ends with real farms from the
+  hold-out, every crop pictured with each model&rsquo;s call.</p>
 </header>
 """,
         banner,
         roster_card(models),
         f'<div class="tiles">{macro_tiles(metrics, models)}'
         f"{agreement_card(agreement, models)}</div>",
+        f"""
+<section id="cascade">
+  <h2>The cascade</h2>
+  <p class="lede">The two multilabel ComFe models fail in opposite places: the 2026-08-21 one
+  reads paddocks almost perfectly but cannot rank dairy or horse, and the master one ranks
+  dairy and horse but calls half the paddocks sheep. So two models are built from saved
+  scores with no training. For a crop <var>x</var>, with
+  <var>p</var><sub>g,c</sub>(<var>x</var>) the gate model&rsquo;s score,
+  <var>p</var><sub>m,c</sub>(<var>x</var>) the livestock model&rsquo;s
+  (<code>{escape(CASCADE["livestock"])}</code> for both) and
+  <var>p</var><sub>h(c),c</sub>(<var>x</var>) the score of the model whose output is passed
+  through for class <var>c</var>, each the mean of its seed runs:</p>
+  <div class="equation">
+    <div><span class="eq-lhs"><var>b</var>(<var>x</var>)</span> = 1 &minus; max<sub><var>c</var> &isin; <var>G</var></sub> <var>p</var><sub>g,<var>c</var></sub>(<var>x</var>)<span class="eq-note">the crop is a building</span></div>
+    <div><span class="eq-lhs"><var>s</var><sub><var>c</var></sub>(<var>x</var>)</span> = <var>p</var><sub>m,<var>c</var></sub>(<var>x</var>) &middot; <var>b</var>(<var>x</var>)<span class="eq-note"><var>c</var> a livestock class</span></div>
+    <div><span class="eq-lhs"><var>s</var><sub><var>c</var></sub>(<var>x</var>)</span> = <var>p</var><sub>h(<var>c</var>),<var>c</var></sub>(<var>x</var>)<span class="eq-note"><var>c</var> &isin; {{paddock, other_industrial}}</span></div>
+    <div><span class="eq-lhs"><var>S</var><sub><var>c</var></sub>(<var>F</var>)</span> = {escape(aggregation)}<sub><var>x</var> &isin; <var>F</var></sub> <var>s</var><sub><var>c</var></sub>(<var>x</var>)<span class="eq-note">farm level, over the farm&rsquo;s crops, as for every model</span></div>
+  </div>
+  <p class="lede"><code>cascade</code>: g = <code>comfe</code>, <var>G</var> = {{paddock,
+  other_industrial}}, h = <code>comfe</code> for both pass-through classes.
+  <code>cascade_p</code>: g = <code>lin</code>, <var>G</var> = {{paddock}}, h(paddock) =
+  <code>lin</code> and h(other_industrial) = <code>comfe</code> &mdash; the linear probe is the
+  better paddock detector and ComFe the better industrial one. Either way a farm&rsquo;s
+  dairy score is its most dairy-like <em>building</em>. Seed runs are paired index-wise. The difference columns are paired on the same bootstrap
+  resamples as everything else on the page, and a &#9679; marks an interval clear of zero.</p>
+  <div class="card">
+    <div class="card-head"><h3>Crop level</h3></div>
+    {cascade_card(metrics, pairs, scored, "crop")}
+  </div>
+  <div class="card">
+    <div class="card-head"><h3>Farm level ({escape(aggregation)} over crops)</h3></div>
+    {cascade_card(metrics, pairs, scored, "farm")}
+  </div>
+</section>
+""",
         f"""
 <section>
   <h2>Average precision by class</h2>
@@ -2304,25 +2739,28 @@ def build_page(
   generations should differ most.</p>
   <div class="card">
     <div class="card-head"><h3>Crop level</h3>
-      <div class="ramp">less{ramp}more of the row</div>
+      <div class="ramp">less{ramp}more of the row</div>{diag_key}
     </div>
     <div class="confusions">
       {"".join(confusion_table(confusions["crop"][m["key"]], m) for m in scored)}
     </div>
   </div>
   <div class="card">
-    <div class="card-head"><h3>Farm level &mdash; each annotated class against the farm's top class</h3>
-      <div class="ramp">less{ramp}more of the row</div>
+    <div class="card-head"><h3>Farm level &mdash; each annotated class against every class the model predicts</h3>
+      <div class="ramp">less{ramp}more of the row</div>{diag_key}
     </div>
-    <p class="lede">Farm labels are multi-label, so a farm carrying two classes appears in both
-    rows, each paired with the same single top class &mdash; the diagonal here means
-    &ldquo;this class is <em>the</em> top class for its farm&rdquo;, which a farm with two
-    classes can satisfy for only one of them. Row totals count annotated (farm, class) pairs,
-    not farms. Note that the multilabel models can put a farm's top score on
-    <code>paddock</code>, which no farm is ever annotated with.</p>
+    <p class="lede">Farm labels are multi-label, so here the model&rsquo;s answer is a set
+    too. {rule_note} A farm annotated with two classes appears in both rows and a farm
+    predicted with two classes in both columns, so the cell (dairy, horse) counts dairy farms
+    that were predicted horse, whether or not they were also predicted dairy. The row count is
+    the number of farms annotated with that class, so the diagonal&rsquo;s row fraction is
+    that class&rsquo;s <em>recall</em>. The last column counts farms annotated with the row
+    class for which the model predicted nothing at all.</p>
     <div class="confusions">
-      {"".join(confusion_table(confusions["farm"][m["key"]], m) for m in scored)}
+      {"".join(confusion_table(confusions["farm"][m["key"]], m, denominators["farm"][m["key"]]) for m in scored)}
     </div>
+    <div class="card-head"><h3>Operating points behind the farm-level panel</h3></div>
+    {operating_table(operating, scored)}
   </div>
 </section>
 """,
@@ -2333,8 +2771,11 @@ def build_page(
   model&rsquo;s top-scoring class with its score. Farms are picked per annotated class to
   span {escape(reference["key"] if reference else "the reference model")}&rsquo;s confidence
   &mdash; its highest-, median- and lowest-scoring farm for that class &mdash; so every group
-  carries a miss beside a hit, and the last group is farms with no livestock annotation at
-  all, ranked on that model&rsquo;s loudest livestock score. The farm-level line compares each
+  carries a miss beside a hit. Each group then adds the {escape(EXAMPLES_CONFUSED)} farms
+  <em>not</em> annotated with that class that the models together rank highest for it, on
+  the mean rank percentile across every model that emits it: the shared false alarms. The
+  last group is farms with no livestock annotation at all, ranked on the reference
+  model&rsquo;s loudest livestock score. The farm-level line compares each
   model&rsquo;s top <em>livestock</em> class ({escape(aggregation)} over its crops) with the
   farm labels, since no farm is annotated paddock. Click any image to enlarge it with the
   calls beside it; the arrow keys step through every image in the gallery, and Escape
@@ -2388,6 +2829,16 @@ def build_page(
     blank, never as zero, and the headline macro is restricted to the nine classes all six
     share so that paddock does not flatter the multilabel families. The master pair also
     emit <code>aqua</code>, which has no VIC positives.</p>
+    <p><strong>The cascades.</strong> Derived from saved scores, not trained. Livestock
+    classes are <code>{escape(CASCADE["livestock"])}</code> times a building gate from a
+    2026-08-21 model; paddock and other_industrial are passed through from a 2026-08-21
+    model. <code>cascade</code> gates on <code>comfe</code>'s paddock and other_industrial
+    and passes both through from <code>comfe</code>; <code>cascade_p</code> gates on
+    <code>lin</code>'s paddock alone, passes paddock through from <code>lin</code> and
+    other_industrial from <code>comfe</code>. Each ensemble is built from the parents'
+    ensembles, and the seed runs pair the parents' seeds index-wise, so a cascade has as
+    many seeds as its shortest parent. Both appear in every chart and table and in the
+    gallery beside the rest.</p>
     <p><strong>The gallery.</strong> Whole-farm images are the build's
     <code>source_image_path</code>, crops its <code>image_path</code>, both inlined as small
     JPEGs. Selection is on the reference model's farm-level score and is spread across its
@@ -2422,6 +2873,13 @@ def main() -> None:
         default="max",
         choices=["max", "mean", "top2"],
         help="how a farm's per-crop scores become one farm score (default max)",
+    )
+    parser.add_argument(
+        "--farm-threshold",
+        default="prevalence",
+        help="how a farm's scores become predicted classes for the farm-level confusion: "
+        "'prevalence' predicts each class for as many farms as are annotated with it "
+        "(default), or a number predicts every class scoring above it",
     )
     parser.add_argument("--bootstrap", type=int, default=200, help="bootstrap resamples")
     parser.add_argument("--seed", type=int, default=0)
@@ -2474,6 +2932,17 @@ def main() -> None:
         for name in model["pending_names"]:
             print(f"          pending: {name}")
         models.append(model)
+
+    for spec in CASCADES:
+        cascade = cascade_model(models, spec)
+        if cascade is None:
+            print(f"  {spec['key']}: skipped, needs both {spec['gate']} and {spec['livestock']}")
+            continue
+        print(f"  {spec['key']:>9}: {spec['livestock']} gated by {spec['gate']} "
+              f"{'+'.join(spec['gate_classes'])}; "
+              + ", ".join(f"{c} from {m}" for c, m in spec["passthrough"].items())
+              + f"; {len(cascade['seeds'])} paired seed run(s)")
+        models.append(cascade)
 
     scored = [m for m in models if m["ensemble"] is not None]
     if not scored:
@@ -2545,18 +3014,31 @@ def main() -> None:
     regions = pd.concat(regions, ignore_index=True)
     agreement = pd.concat(agreement, ignore_index=True)
 
-    confusions = {
-        "crop": {
-            m["key"]: confusion(crop, m, "no class marked")
-            for m in models
-            if m["ensemble"] is not None
-        },
-        "farm": {
-            m["key"]: confusion(farm, m, "no class marked")
-            for m in farm_models
-            if m["ensemble"] is not None
-        },
-    }
+    farm_rule = args.farm_threshold
+    if farm_rule != "prevalence":
+        try:
+            float(farm_rule)
+        except ValueError:
+            raise SystemExit(f"--farm-threshold must be 'prevalence' or a number, not {farm_rule!r}")
+
+    # Crop level stays against the single top class: only 17 crops carry two labels.
+    # Farm level is set against set, at the operating point --farm-threshold names.
+    confusions = {"crop": {}, "farm": {}}
+    denominators = {"crop": {}, "farm": {}}
+    operating = []
+    for m in models:
+        if m["ensemble"] is not None:
+            confusions["crop"][m["key"]] = confusion(crop, m, "no class marked")
+    for m in farm_models:
+        if m["ensemble"] is None:
+            continue
+        predicted, points = decisions(m, farm, farm_rule)
+        operating.append(points)
+        confusions["farm"][m["key"]], denominators["farm"][m["key"]] = confusion_sets(
+            farm, m, predicted, "no class marked"
+        )
+    operating = pd.concat(operating, ignore_index=True)
+    operating.insert(0, "rule", farm_rule)
 
     # ---- console summary -------------------------------------------------------------
     for level in LEVELS:
@@ -2599,6 +3081,7 @@ def main() -> None:
         pd.concat(tables, names=["model", "annotated"]).to_csv(
             args.output / f"confusion_{level}.csv"
         )
+    operating.to_csv(args.output / "operating_points_farm.csv", index=False)
 
     pd.DataFrame(
         [
@@ -2666,7 +3149,7 @@ def main() -> None:
     )
     gallery, groups, reasons = "", [], {}
     if reference is not None:
-        groups, reasons = choose_examples(farms, farm, reference)
+        groups, reasons = choose_examples(farms, farm, reference, farm_models)
         gallery = farm_gallery(groups, reasons, farms, test, crop, models, farm_models)
         print(
             f"gallery: {len(reasons)} farms over {len(groups)} groups, "
@@ -2702,6 +3185,9 @@ def main() -> None:
             len(test),
             len(farms),
             args.aggregation,
+            denominators,
+            operating,
+            farm_rule,
             gallery,
             reference,
             len(master_train),
@@ -2712,8 +3198,8 @@ def main() -> None:
 
     print(
         f"\nwrote {destination} plus evaluation{{,_pairs,_by_region}}.csv, agreement.csv, "
-        f"scores_{{crop,farm}}.csv, confusion_{{crop,farm}}.csv, models.csv, examples.csv "
-        f"in {args.output}"
+        f"scores_{{crop,farm}}.csv, confusion_{{crop,farm}}.csv, operating_points_farm.csv, "
+        f"models.csv, examples.csv in {args.output}"
     )
 
 

@@ -472,7 +472,12 @@ imagery is inlined as small JPEGs, so the page is a few megabytes and opens anyw
 The 2026-09-04 runs save their prediction index as the test split's `group_id` rather
 than a row number (the data module was given `test_csv_group`); the loader maps either
 form back onto rows. Both scripts take `--aggregation {max,mean,top2}`, `--bootstrap`
-(default 200), `--seed`, `--output` and `--file`.
+(default 200), `--seed`, `--output` and `--file`. The 2026-09-04 script also takes
+`--farm-threshold`: the farm-level confusion panel is set against set, and this says how
+a farm's scores become predicted classes — `prevalence` (default) predicts each class for
+as many farms as are annotated with it, so precision equals recall and the diagonal reads
+as recall; a number predicts every class scoring above it. The operating points land in
+`operating_points_farm.csv`.
 
 
 # Notes from next
