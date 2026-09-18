@@ -75,6 +75,7 @@ SOURCE_TO_EXTRACT = {
     "autocrops": "training",
     "generalisation": "generalisation",
     "generalisation_extra": "generalisation_extra",
+    "generalisation_extra_test": "generalisation_extra_test",
 }
 
 # The prompts whose absence says "paddock" - `DEFAULT_PROMPTS` in sam3_pipeline.py, in

@@ -248,9 +248,12 @@ a dataset the models can train on. The builder's `dataset.csv` labels every crop
 one shed and nine paddocks — so this reads the per-crop `Label` from each workbook's
 "Image labels" sheet and writes `dataset_relabelled.csv` keyed on that instead.
 
+    BUILDER=/home/mannixe/FLIP/flip-geoimage-dataset-builder
     python gen_dataset_croplevel.py --workbooks '2026_07_24_*'
     python gen_dataset_croplevel.py --workbooks '2026_08_21_generalisation_extra_*' \
-        --dataset /home/mannixe/FLIP/flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation_extra/dataset.csv
+        --dataset $BUILDER/original_new_2026_08_21_generalisation_extra/dataset.csv
+    python gen_dataset_croplevel.py --workbooks '2026_09_18_generalisation_extra_test_*' \
+        --dataset $BUILDER/original_new_2026_09_18_generalisation_extra_test/dataset.csv
 
 Defaults to the same `original_new_2026_08_21_generalisation/dataset.csv` as
 `make_spreadsheet.py`, and writes into that same directory — beside the build's own
@@ -281,6 +284,14 @@ the train/val pool, and only nine of its crops are anything but `Ambiguous`.
 Nearly all of it is background — 339 residential, 296 other/industrial, 322 paddock —
 with 60 livestock crops. The parcels carry no `Farm_type`, so the crop-label-versus-
 farm-label comparison the script prints is empty for this build.
+
+The third run is the VicPICs supplement (`original_new_2026_09_18_generalisation_extra_test`,
+3,312 crops over 301 sheep / poultry / pig farms — see "Generalisation extra test"
+above). Its single source, `Vic_PICs_generalisation_extras_sept26`, is listed with the
+VIC reaches, so **every crop of it is test** and the train/val csvs come out empty. Its
+workbook is `2026_09_18_generalisation_extra_test_relabel_farm_and_image_vicpics.xlsx`;
+until that is filled in and moved into `labelled_sheets/` the run matches nothing and
+stops with an error, and the master build below carries on without the source.
 
 The join is on `(farm_uid, ecw_stem, building_cluster)`, not `image_path`: the workbooks
 were written against the PFI-keyed collection, so their paths still read
@@ -372,7 +383,7 @@ Each row carries the class list and both the old and new labels, so nothing is l
 
 # building the master dataset
 
-`gen_dataset_master.py` combines the four current FLIP datasets into one training corpus
+`gen_dataset_master.py` combines the five current FLIP datasets into one training corpus
 with four named test sets, written to `original_master_2026_09_18/`. The earlier
 `original_master_2026_09_04/` build — three sources, before the `generalisation_extra`
 relabels — is what the 2026-09-04 evaluation, the SAM3 relabel and the post-classifier
@@ -383,7 +394,7 @@ were measured on, and is left as it was.
     python gen_dataset_master_html.py            # the summary dashboard
     xdg-open original_master_2026_09_18/summary.html
 
-The four sources, in the order the generated README introduces them:
+The five sources, in the order the generated README introduces them:
 
     historical            flip-dataset-processing/output/flip_historical
                           whole-farm .png photographs from the original pipeline
@@ -396,12 +407,18 @@ The four sources, in the order the generated README introduces them:
     generalisation_extra  flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation_extra
                           crops cut from the Lot_* parcels on the same reaches plus
                           Casino, Corowa, Hanwood and Redlands, relabelled the same way
+    generalisation_extra_test
+                          flip-geoimage-dataset-builder/original_new_2026_09_18_generalisation_extra_test
+                          the Sept 2026 VicPICs supplement, relabelled the same way and
+                          wholly held out as test
 
 They are not independent, which is the whole difficulty. `autocrops` and `historical` are
 two different crops of the same source photographs (2,398 names in common), and
 `generalisation` is the crop-level relabelling of exactly the imagery `historical` holds
 whole in `gen_all_df.csv`. `generalisation_extra` records no source photograph and shares
-no crop with `generalisation`, but eight of its farms are also in `autocrops`. Their
+no crop with `generalisation`, but eight of its farms are also in `autocrops`.
+`generalisation_extra_test` is cut from the same VIC rasters as `autocrops`, and 20 of
+its 301 farms (341 crops) are `autocrops` farms too. Their
 upstream splits were also decided on different principles — a curated 2022 FarmFinder
 hold-out for `historical` and `autocrops`, a geographic NSW/VIC hold-out for the two
 relabelled sources — so the generated README documents each one rather than leaving a
@@ -424,6 +441,15 @@ reader to assume a single rule.
 labelled yet, so `test_autocrop_gen_vic.csv` is unchanged from the 2026-09-04 build.
 None of its rows were pulled to overlap — its eight farms shared with `autocrops` are
 all on the training side there too.
+
+`generalisation_extra_test` goes **entirely into `test_autocrop_gen_vic`**, and takes
+the overlapping training rows with it under the test-wins rule: the 183 `autocrops`
+train rows and 16 val rows on its 20 shared farms move to `train_overlap.csv` /
+`val_overlap.csv`, and the 74 `autocrops` test rows on those farms stay in
+`test_autocrops` flagged in `overlap_with`. The numbers above are from before its
+workbook was filled in; once it is, and the croplevel run above has produced its csvs,
+rerunning the master adds 3,312 test rows and moves those 199. Until then the source
+prints as "not yet relabelled" and contributes nothing.
 
 Every input row appears exactly once across those nine csvs — the script asserts it, along
 with no group in two splits and no train/val row reaching a test set, before writing
@@ -456,6 +482,8 @@ follows the level the labels were actually assigned at:
     autocrops             farm_uid x ecw_stem          3,208 groups   mean 6.5, max 10
     generalisation        crop path x ecw_stem         1,629 groups   1 row each
     generalisation_extra  crop path x ecw_stem         1,017 groups   1 row each
+    generalisation_extra_test
+                          crop path x ecw_stem         3,312 groups   1 row each, once labelled
 
 `autocrops` groups by farm because one farm-level label covers every crop of it; the
 others group by image because each image carries its own label. `generalisation` in
@@ -478,8 +506,9 @@ sources. Groups never span datasets and never span splits; the raw `farm_uid`,
 
 `gen_dataset_master.py`:
 
-- `--autocrops` / `--generalisation` / `--generalisation-extra` / `--historical` — the
-  four source directories.
+- `--autocrops` / `--generalisation` / `--generalisation-extra` /
+  `--generalisation-extra-test` / `--historical` — the five source directories. A
+  relabelled source whose csvs do not exist yet contributes no rows.
 - `--output-dir` — where the master dataset is written (default
   `original_master_2026_09_18/`).
 - `--imagery {copy,symlink,none}` — copy the imagery in (default), symlink it, or write

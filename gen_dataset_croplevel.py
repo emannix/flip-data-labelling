@@ -20,25 +20,34 @@ already does for a farm labelled "dairy,beef". Only "Ambiguous" crops are droppe
 outright: this rebuilds the dataset from scratch, so there is no historical split to
 stay compatible with and no reason to write rows the loaders must know to skip.
 
-There are two builder releases to relabel, and the script is run once per release:
+There are three builder releases to relabel, and the script is run once per release:
 
-    original_new_2026_08_21_generalisation        the case-study farms, workbooks named
-                                                  2026_07_24_generalisation_relabel_*
-    original_new_2026_08_21_generalisation_extra  the Lot_* parcels on the same reaches
-                                                  plus new ones, workbooks named
-                                                  2026_08_21_generalisation_extra_relabel_*
+    original_new_2026_08_21_generalisation             the case-study farms, workbooks
+                                                       2026_07_24_generalisation_relabel_*
+    original_new_2026_08_21_generalisation_extra       the Lot_* parcels on the same
+                                                       reaches plus new ones, workbooks
+                                                       2026_08_21_generalisation_extra_relabel_*
+    original_new_2026_09_18_generalisation_extra_test  the Sept 2026 VicPICs supplement,
+                                                       sheep / poultry / pig farms cut
+                                                       from the VIC training rasters,
+                                                       one workbook
+                                                       2026_09_18_generalisation_extra_test_relabel_*
 
-The two share no farm and no crop, and each build's image_path is relative to its own
-directory, so each is relabelled in place and gen_dataset_master.py combines them as two
-sources. --workbooks narrows labelled_sheets/ to one release's workbooks; without it every
-workbook is read and the other release's crops are reported as unmatched.
+The three share no crop with each other, and each build's image_path is relative to its
+own directory, so each is relabelled in place and gen_dataset_master.py combines them as
+separate sources. --workbooks narrows labelled_sheets/ to one release's workbooks; without
+it every workbook is read and the other releases' crops are reported as unmatched.
 
 Splits are geographic, so the held-out set is a different landscape rather than a
 different farm in the same one:
 
     train/val  NSW  - bega, caniaba, freemans, mangrove, nowra,
                       and from the extra build casino, corowa, hanwood, redlands
-    test       VIC  - bacchusmarsh, balliang, gisborne, wyuna
+    test       VIC  - bacchusmarsh, balliang, gisborne, wyuna,
+                      and the whole VicPICs supplement (source vic_pics)
+
+The VicPICs build is wholly held out: every crop of it is test, and the master build
+pulls any autocrops training row on the same farm out into its overlap files.
 
 The extra build names its NSW reaches "Lot_<reach>_clean_clip.shp", so a leading "lot_"
 is ignored when matching. Redlands is in Queensland rather than NSW, but it is not VIC
@@ -93,7 +102,9 @@ NSW_SOURCES = [
     "bega", "caniaba", "freemans", "mangrove", "nowra",
     "casino", "corowa", "hanwood", "redlands",
 ]
-VIC_SOURCES = ["bacchusmarsh", "balliang", "gisborne", "wyuna"]
+# "vic_pics" is the single source of the VicPICs supplement build,
+# "Vic_PICs_generalisation_extras_sept26"; the whole of it is test.
+VIC_SOURCES = ["bacchusmarsh", "balliang", "gisborne", "wyuna", "vic_pics"]
 # Which workbooks in the labelled directory to read, by default all of them.
 WORKBOOK_PATTERN = "*.xlsx"
 

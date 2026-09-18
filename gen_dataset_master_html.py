@@ -22,7 +22,7 @@ image while resting on a handful of farms, so every class breakdown is given by 
 
 Charts are inline SVG and CSS built here rather than by a plotting library, so the page
 has no external dependencies. Colours are the validated default data-viz palette used
-unchanged: categorical slots 1-4 for the four source datasets, in the palette's documented
+unchanged: categorical slots 1-5 for the five source datasets, in the palette's documented
 order, and the blue sequential ramp for the class matrices. Slot 3 sits below 3:1 on the
 light surface, so every chart carries direct labels and a table view rather than leaning
 on hue.
@@ -65,15 +65,16 @@ SPLITS = [
 SPLIT_ORDER = [name for name, _ in SPLITS]
 ROLE_OF = dict(SPLITS)
 
-# Categorical slots 1-4 from the reference palette, light value first, in the palette's
+# Categorical slots 1-5 from the reference palette, light value first, in the palette's
 # own slot order (which it documents as passing the adjacent-pair checks in both modes).
-# Slots 1-3 are the all-pairs-safe prefix; slot 4 leans on the direct labels and table
-# view every chart already carries.
+# Slots 1-3 are the all-pairs-safe prefix; slots 4 and 5 lean on the direct labels and
+# table view every chart already carries.
 SOURCES = {
     "historical": ("#1baf7a", "#199e70"),
     "autocrops": ("#2a78d6", "#3987e5"),
     "generalisation": ("#eb6834", "#d95926"),
     "generalisation_extra": ("#eda100", "#c98500"),
+    "generalisation_extra_test": ("#e87ba4", "#d55181"),
 }
 SOURCE_ORDER = list(SOURCES)
 
@@ -547,7 +548,7 @@ def provenance_cards(df: pd.DataFrame) -> str:
     """One card per source: where it is built, what a row is, and how it was split.
 
     They were split on different principles — a curated 2022 hold-out for two of them, a
-    geographic hold-out for the two relabelled ones — so a reader who assumes one rule for
+    geographic hold-out for the relabelled ones — so a reader who assumes one rule for
     all of them will misread the test numbers. That is why this sits on the page at all.
     """
     cards = []
@@ -628,6 +629,7 @@ STYLE = """
   --src-autocrops: #2a78d6;
   --src-generalisation: #eb6834;
   --src-generalisation_extra: #eda100;
+  --src-generalisation_extra_test: #e87ba4;
   --src-historical: #1baf7a;
   --heat-0: #f4f7fb; --heat-1: #cde2fb; --heat-2: #9ec5f4; --heat-3: #6da7ec;
   --heat-4: #3987e5; --heat-5: #256abf; --heat-6: #0d366b;
@@ -649,6 +651,7 @@ STYLE = """
     --src-autocrops: #3987e5;
     --src-generalisation: #d95926;
     --src-generalisation_extra: #c98500;
+    --src-generalisation_extra_test: #d55181;
     --src-historical: #199e70;
     --heat-0: #1f2429; --heat-1: #0d366b; --heat-2: #184f95; --heat-3: #256abf;
     --heat-4: #3987e5; --heat-5: #6da7ec; --heat-6: #9ec5f4;
@@ -670,6 +673,7 @@ STYLE = """
   --src-autocrops: #3987e5;
   --src-generalisation: #d95926;
   --src-generalisation_extra: #c98500;
+  --src-generalisation_extra_test: #d55181;
   --src-historical: #199e70;
   --heat-0: #1f2429; --heat-1: #0d366b; --heat-2: #184f95; --heat-3: #256abf;
   --heat-4: #3987e5; --heat-5: #6da7ec; --heat-6: #9ec5f4;
@@ -727,6 +731,7 @@ h3 { font-size: 15px; margin: 0; font-weight: 600; }
 .swatch-autocrops { background: var(--src-autocrops); }
 .swatch-generalisation { background: var(--src-generalisation); }
 .swatch-generalisation_extra { background: var(--src-generalisation_extra); }
+.swatch-generalisation_extra_test { background: var(--src-generalisation_extra_test); }
 .swatch-historical { background: var(--src-historical); }
 
 .mark { cursor: default; }
@@ -958,13 +963,15 @@ def build(dataset: Path) -> str:
 <section>
   <h2>Reading these numbers</h2>
   <div class="notes">
-    <p><strong>False is not a verified negative.</strong> The four sources carry different
+    <p><strong>False is not a verified negative.</strong> The five sources carry different
     class lists, and a class a source never assessed is written <code>False</code>.
-    <code>paddock</code> and <code>other_industrial</code> are only ever true on
-    <code>generalisation</code> and <code>generalisation_extra</code> rows.</p>
+    <code>paddock</code> and <code>other_industrial</code> are only ever true on the
+    relabelled sources' rows.</p>
     <p><strong>Farms are not comparable across sources.</strong> <code>historical</code>
     carries no <code>farm_uid</code>; <code>autocrops</code> shares 24 of its farms with
-    <code>generalisation</code> and 8 with <code>generalisation_extra</code>. Groups are
+    <code>generalisation</code>, 8 with <code>generalisation_extra</code> and 20 with
+    <code>generalisation_extra_test</code>, whose test rows pull those
+    <code>autocrops</code> training rows out to overlap. Groups are
     keyed by source as well as identifier and
     capture, so they never span datasets and never span splits. <code>generalisation</code>
     groups by image because its labels are per-crop; its split integrity comes from its
