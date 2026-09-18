@@ -19,14 +19,15 @@ survives once its probe rival sits on the same ViT-L features.
     lin_l      DINOv2 ViT-L/14 with registers       LVD-142M web images        ComFe's backbone
     lin_v3     DINOv3 ViT-L/16                      LVD-1689M web images
     lin_sat    DINOv3 ViT-L/16, satellite weights   SAT-493M aerial/satellite
-    lin_radio  C-RADIOv4 SO400M                     agglomerative distillation  no run has saved anything
+    lin_radio  C-RADIOv4 SO400M                     agglomerative distillation  relaunched 2026-09-18
     comfe_l    ComFe on DINOv2 ViT-L/14 w/ reg.     LVD-142M web images        the 2026-09-04 `comfe_m`
 
 `lin_s` and `comfe_l` are the 2026-09-04 runs re-read, so their numbers repeat the earlier
 dashboard exactly; only the keys are renamed so that the key names the backbone. The
-C-RADIOv4 runs all stopped while fetching the checkpoint from Hugging Face and left no
-prediction, checkpoint or error; they are reported as dead rather than pending, on the
-age of their logs, and the roster says so.
+C-RADIOv4 runs of 2026-09-11 all stopped while fetching the checkpoint from Hugging Face
+and left no prediction, checkpoint or error; they were relaunched on 2026-09-18 as batch
+`384a1` and all four seeds have now saved a test prediction. `lin_radio`'s `match` names
+that batch, so the four abandoned directories are not read at all.
 
 *Same truth, same subset.* `test_autocrop_gen_vic.csv`, 1,146 crops over the two VIC
 reaches, and the same well-sampled class subset as the two earlier pages - a class must
@@ -121,8 +122,8 @@ SWEEP = VIEW / "flip_2026_09_04"
 BACKBONES = SWEEP / "other_backbones"
 
 # A run with nothing saved whose log has not moved for this long is dead, not training.
-# The sweep's live runs write to main.log every few minutes; the C-RADIOv4 logs stopped on
-# 2026-09-11 at the checkpoint download.
+# The sweep's live runs write to main.log every few minutes; the abandoned 2026-09-11
+# C-RADIOv4 logs stopped at the checkpoint download and are no longer matched.
 STALE_HOURS = 24
 
 # The six families, in display order. `match` is a substring of the run directory name
@@ -198,7 +199,7 @@ MODELS = [
         "classes": MASTER_CLASSES,
         "space": "test",
         "runs": BACKBONES,
-        "match": "radiov4_linear_finetune_so400m_1-5",
+        "match": "384a1_flip_2026_09_04_radiov4_linear_finetune_so400m_1-5",
     },
     {
         "key": "comfe_l",
@@ -809,9 +810,11 @@ def build_page(
     <code>{escape(BACKBONES.name)}/</code> under the same view.</p>
     <p><strong>Dead runs.</strong> A run with no saved prediction is <em>training</em> if
     its <code>main.log</code> changed in the last {STALE_HOURS} hours and <em>dead</em>
-    otherwise. The four C-RADIOv4 logs end at the Hugging Face checkpoint download on
-    2026-09-11 with no error, checkpoint or event file, so the family is on the roster with
-    nothing to score.</p>
+    otherwise. C-RADIOv4's first four runs, launched 2026-09-11, ended at the Hugging Face
+    checkpoint download with no error, checkpoint or event file; they were relaunched on
+    2026-09-18 and all four seeds of that batch have saved a prediction. This page reads the
+    relaunched batch only, so the abandoned directories are left out rather than reported
+    as dead.</p>
     <p><strong>Class vocabularies.</strong> Every model emits the same twelve classes, read
     back off each run's own <code>.hydra/config.yaml</code> before scoring. The headline
     macro is still restricted to the nine livestock classes and then to the well-sampled
