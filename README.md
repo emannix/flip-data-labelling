@@ -155,7 +155,9 @@ a dataset the models can train on. The builder's `dataset.csv` labels every crop
 one shed and nine paddocks — so this reads the per-crop `Label` from each workbook's
 "Image labels" sheet and writes `dataset_relabelled.csv` keyed on that instead.
 
-    python gen_dataset_croplevel.py
+    python gen_dataset_croplevel.py --workbooks '2026_07_24_*'
+    python gen_dataset_croplevel.py --workbooks '2026_08_21_generalisation_extra_*' \
+        --dataset /home/mannixe/FLIP/flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation_extra/dataset.csv
 
 Defaults to the same `original_new_2026_08_21_generalisation/dataset.csv` as
 `make_spreadsheet.py`, and writes into that same directory — beside the build's own
@@ -163,6 +165,29 @@ Defaults to the same `original_new_2026_08_21_generalisation/dataset.csv` as
 so no imagery is moved or copied. Of the build's 2,913 crops, the 1,705 that have been
 labelled come through less the 76 marked `Ambiguous`, for 1,629. The rest (bacchusmarsh
 and gisborne) are waiting on their workbooks.
+
+The second run does the same for the `generalisation_extra` build — the `Lot_*` parcels
+on the same reaches plus Casino, Corowa, Hanwood and Redlands, whose workbooks are the
+`2026_08_21_generalisation_extra_*` ones. The two builds share no farm and no crop, and
+each build's `image_path` is relative to its own directory, so each is relabelled in
+place and `gen_dataset_master.py` below combines them as two sources. `--workbooks`
+narrows `labelled_sheets/` to one build's workbooks; without it every workbook is read
+and the other build's crops are reported as unmatched. The extra build's NSW shapefiles
+are named `Lot_<reach>_clean_clip.shp`, so a leading `lot_` is ignored when a source is
+matched to a region. Of its 2,622 crops the 1,135 labelled so far (the eight NSW reaches)
+come through less 118 `Ambiguous`, for 1,017 — all train/val, since its VIC workbooks
+are not done yet. Redlands is in Queensland rather than NSW; it is not VIC and so joins
+the train/val pool, and only nine of its crops are anything but `Ambiguous`.
+
+    original_new_2026_08_21_generalisation_extra/
+        dataset_relabelled.csv     1,017 crops over 650 farms
+        relabelled_train_df.csv      800 crops
+        relabelled_val_df.csv        217 crops
+        relabelled_test_df.csv         0 crops
+
+Nearly all of it is background — 339 residential, 296 other/industrial, 322 paddock —
+with 60 livestock crops. The parcels carry no `Farm_type`, so the crop-label-versus-
+farm-label comparison the script prints is empty for this build.
 
 The join is on `(farm_uid, ecw_stem, building_cluster)`, not `image_path`: the workbooks
 were written against the PFI-keyed collection, so their paths still read
@@ -254,43 +279,58 @@ Each row carries the class list and both the old and new labels, so nothing is l
 
 # building the master dataset
 
-`gen_dataset_master.py` combines the three current FLIP datasets into one training corpus
-with four named test sets, written to `original_master_2026_09_04/`.
+`gen_dataset_master.py` combines the four current FLIP datasets into one training corpus
+with four named test sets, written to `original_master_2026_09_18/`. The earlier
+`original_master_2026_09_04/` build — three sources, before the `generalisation_extra`
+relabels — is what the 2026-09-04 evaluation, the SAM3 relabel and the post-classifier
+were measured on, and is left as it was.
 
     python gen_dataset_master.py                 # ~38 GB of imagery copied, a few minutes
     python gen_dataset_master.py --dry-run       # csvs + README only, no imagery
     python gen_dataset_master_html.py            # the summary dashboard
-    xdg-open original_master_2026_09_04/summary.html
+    xdg-open original_master_2026_09_18/summary.html
 
-The three sources, in the order the generated README introduces them:
+The four sources, in the order the generated README introduces them:
 
-    historical       flip-dataset-processing/output/flip_historical
-                     whole-farm .png photographs from the original pipeline
-    autocrops        flip-geoimage-dataset-builder/original_new_2026_08_21
-                     building crops re-cut from those same photographs, farm-level labels
-    generalisation   flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation
-                     the case-study subset of those crops, relabelled crop by crop
-                     by `gen_dataset_croplevel.py` above
+    historical            flip-dataset-processing/output/flip_historical
+                          whole-farm .png photographs from the original pipeline
+    autocrops             flip-geoimage-dataset-builder/original_new_2026_08_21
+                          building crops re-cut from those same photographs, farm-level
+                          labels
+    generalisation        flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation
+                          the case-study subset of those crops, relabelled crop by crop
+                          by `gen_dataset_croplevel.py` above
+    generalisation_extra  flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation_extra
+                          crops cut from the Lot_* parcels on the same reaches plus
+                          Casino, Corowa, Hanwood and Redlands, relabelled the same way
 
 They are not independent, which is the whole difficulty. `autocrops` and `historical` are
 two different crops of the same source photographs (2,398 names in common), and
 `generalisation` is the crop-level relabelling of exactly the imagery `historical` holds
-whole in `gen_all_df.csv`. Their upstream splits were also decided on three different
-principles — a curated 2022 FarmFinder hold-out for `historical` and `autocrops`, a
-geographic NSW/VIC hold-out for `generalisation` — so the generated README documents each
-one rather than leaving a reader to assume a single rule.
+whole in `gen_all_df.csv`. `generalisation_extra` records no source photograph and shares
+no crop with `generalisation`, but eight of its farms are also in `autocrops`. Their
+upstream splits were also decided on different principles — a curated 2022 FarmFinder
+hold-out for `historical` and `autocrops`, a geographic NSW/VIC hold-out for the two
+relabelled sources — so the generated README documents each one rather than leaving a
+reader to assume a single rule.
 
 ## what comes out
 
-    dataset.csv                     25,968 rows / 7,594 groups, every row with its provenance
-    train_df.csv                    17,927      val_df.csv                       4,320
+    dataset.csv                     26,985 rows / 9,390 groups, every row with its provenance
+    train_df.csv                    18,727      val_df.csv                       4,537
     train_overlap.csv                  118      val_overlap.csv                     32
     test_autocrops.csv               1,361      test_autocrop_gen_vic.csv        1,146
     test_gen_original.csv              777      test_gen_original_overlap.csv      151
     test_original.csv                  136
     README.md                       generated: provenance, rules, per-split class tables
     summary.html                    the dashboard, from gen_dataset_master_html.py
-    autocrops/ generalisation/ historical/     imagery, each at its original relative path
+    autocrops/ generalisation/ generalisation_extra/ historical/
+                                    imagery, each at its original relative path
+
+`generalisation_extra` adds 1,017 rows, all to train/val: its VIC reaches are not
+labelled yet, so `test_autocrop_gen_vic.csv` is unchanged from the 2026-09-04 build.
+None of its rows were pulled to overlap — its eight farms shared with `autocrops` are
+all on the training side there too.
 
 Every input row appears exactly once across those nine csvs — the script asserts it, along
 with no group in two splits and no train/val row reaching a test set, before writing
@@ -319,12 +359,13 @@ are test sets, and they measure whole-image old labels against crop-level new la
 A group is **dataset x identifier x imagery source** — the unit training draws on, so it
 follows the level the labels were actually assigned at:
 
-    historical       image path x collection      3,536 groups   1 row each
-    autocrops        farm_uid x ecw_stem          3,208 groups   mean 6.5, max 10
-    generalisation   crop path x ecw_stem         1,629 groups   1 row each
+    historical            image path x collection      3,536 groups   1 row each
+    autocrops             farm_uid x ecw_stem          3,208 groups   mean 6.5, max 10
+    generalisation        crop path x ecw_stem         1,629 groups   1 row each
+    generalisation_extra  crop path x ecw_stem         1,017 groups   1 row each
 
-`autocrops` groups by farm because one farm-level label covers every crop of it; the other
-two group by image because each image carries its own label. `generalisation` in
+`autocrops` groups by farm because one farm-level label covers every crop of it; the
+others group by image because each image carries its own label. `generalisation` in
 particular sits on the same farms as `autocrops` but was labelled crop by crop, so the
 crop is the training example — its split integrity comes from its own farm-grouped
 geographic split upstream, not from `group_id`.
@@ -344,9 +385,10 @@ sources. Groups never span datasets and never span splits; the raw `farm_uid`,
 
 `gen_dataset_master.py`:
 
-- `--autocrops` / `--generalisation` / `--historical` — the three source directories.
+- `--autocrops` / `--generalisation` / `--generalisation-extra` / `--historical` — the
+  four source directories.
 - `--output-dir` — where the master dataset is written (default
-  `original_master_2026_09_04/`).
+  `original_master_2026_09_18/`).
 - `--imagery {copy,symlink,none}` — copy the imagery in (default), symlink it, or write
   only the csvs.
 - `--val-fraction` — share of the `hpai` rows given to val (default 0.20). `hpai_df.csv`
@@ -456,9 +498,20 @@ step:
 - `gen_evaluation_2026_09_04.py` — the same four plus the 2026-09-04 pair retrained on
   `original_master_2026_09_04/train_df.csv`, on `test_autocrop_gen_vic.csv` (the same
   1,146 crops row for row, checked at load time). Writes `output_eval_2026_09_04/`.
+- `gen_evaluation_2026_09_04_backbones.py` — the 2026-09-11 backbone sweep under
+  `view/flip_2026_09_04/other_backbones/`: the master-build linear probe retrained on
+  DINOv2 ViT-L/14 with registers, DINOv3 ViT-L/16 (web and satellite weights) and
+  C-RADIOv4, beside the 2026-09-04 ViT-S probe and ComFe re-read as `lin_s` and `comfe_l`.
+  Imports every scoring and chart routine from the 2026-09-04 script, drops the cascades,
+  and adds `macro_pairs.csv`: the well-sampled macro bootstrapped and differenced pair by
+  pair, which is the one number to read a backbone off. Runs with no saved prediction
+  whose log has been quiet for a day are reported as dead rather than pending. Writes
+  `output_eval_2026_09_04_backbones/`.
 
       .venv/bin/python gen_evaluation_2026_09_04.py
       xdg-open output_eval_2026_09_04/evaluation_dashboard.html
+      .venv/bin/python gen_evaluation_2026_09_04_backbones.py
+      xdg-open output_eval_2026_09_04_backbones/evaluation_dashboard.html
 
 The 2026-09-04 page adds two things. The per-class table carries a training count per
 multilabel generation (397 relabelled NSW crops against 17,927 master crops, of which

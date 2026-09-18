@@ -20,11 +20,30 @@ already does for a farm labelled "dairy,beef". Only "Ambiguous" crops are droppe
 outright: this rebuilds the dataset from scratch, so there is no historical split to
 stay compatible with and no reason to write rows the loaders must know to skip.
 
+There are two builder releases to relabel, and the script is run once per release:
+
+    original_new_2026_08_21_generalisation        the case-study farms, workbooks named
+                                                  2026_07_24_generalisation_relabel_*
+    original_new_2026_08_21_generalisation_extra  the Lot_* parcels on the same reaches
+                                                  plus new ones, workbooks named
+                                                  2026_08_21_generalisation_extra_relabel_*
+
+The two share no farm and no crop, and each build's image_path is relative to its own
+directory, so each is relabelled in place and gen_dataset_master.py combines them as two
+sources. --workbooks narrows labelled_sheets/ to one release's workbooks; without it every
+workbook is read and the other release's crops are reported as unmatched.
+
 Splits are geographic, so the held-out set is a different landscape rather than a
 different farm in the same one:
 
-    train/val  NSW  - bega, caniaba, freemans, mangrove, nowra
+    train/val  NSW  - bega, caniaba, freemans, mangrove, nowra,
+                      and from the extra build casino, corowa, hanwood, redlands
     test       VIC  - bacchusmarsh, balliang, gisborne, wyuna
+
+The extra build names its NSW reaches "Lot_<reach>_clean_clip.shp", so a leading "lot_"
+is ignored when matching. Redlands is in Queensland rather than NSW, but it is not VIC
+and so goes in the train/val pool; only nine of its crops are labelled anything but
+Ambiguous, so the choice barely registers.
 
 Within NSW the train/val cut follows extract_imagery_aerial_csv.py: farm-grouped so a
 farm's crops never straddle the two, stratified on the farm's class, VAL_FRACTION of
@@ -65,9 +84,18 @@ LABEL_COLUMN = "Label"
 COMMENTS_COLUMN = "Comments"
 
 # The reaches making up each region. Matched case-insensitively against the start of
-# the `source` shapefile name, as in make_spreadsheet.py.
-NSW_SOURCES = ["bega", "caniaba", "freemans", "mangrove", "nowra"]
+# the `source` shapefile name, as in make_spreadsheet.py, after any leading "lot_" is
+# dropped: the extra build's shapefiles are "Lot_Bega_clean_clip.shp" and so on.
+# Casino, Corowa and Hanwood are NSW reaches that only the extra build covers. Redlands
+# is Queensland; it is listed with NSW because the hold-out is VIC and everything else
+# is the training pool (see the module docstring).
+NSW_SOURCES = [
+    "bega", "caniaba", "freemans", "mangrove", "nowra",
+    "casino", "corowa", "hanwood", "redlands",
+]
 VIC_SOURCES = ["bacchusmarsh", "balliang", "gisborne", "wyuna"]
+# Which workbooks in the labelled directory to read, by default all of them.
+WORKBOOK_PATTERN = "*.xlsx"
 
 # The workbook dropdowns offer the class list plus four catch-alls. Two of those are
 # real crop classes — most crops in this collection are paddock or a non-farm building
@@ -160,11 +188,12 @@ def read_sheet(path, name):
     return rows
 
 
-def workbooks(directory):
-    return [p for p in sorted(directory.glob("*.xlsx")) if not p.name.startswith("~$")]
+def workbooks(directory, pattern=WORKBOOK_PATTERN):
+    """The workbooks under directory matching pattern, minus Excel's ~$ lock files."""
+    return [p for p in sorted(directory.glob(pattern)) if not p.name.startswith("~$")]
 
 
-def read_crop_labels(directory):
+def read_crop_labels(directory, pattern=WORKBOOK_PATTERN):
     """Every labelled crop across the workbooks, keyed on its crop_key triple.
 
     A crop labelled in two workbooks (a reach relabelled after a first pass) keeps the
@@ -172,7 +201,7 @@ def read_crop_labels(directory):
     """
     labels = {}
     duplicates = []
-    for path in workbooks(directory):
+    for path in workbooks(directory, pattern):
         rows = read_sheet(path, IMAGE_SHEET)
         if rows is None:
             continue
@@ -191,7 +220,7 @@ def read_crop_labels(directory):
     return labels, duplicates
 
 
-def read_farm_labels(directory):
+def read_farm_labels(directory, pattern=WORKBOOK_PATTERN):
     """Per-farm class set from the "Farm labels" sheets, as a comma-separated string.
 
     The farm sheet marks each class the labeller saw anywhere on the farm with an X,
@@ -199,7 +228,7 @@ def read_farm_labels(directory):
     still says what the whole farm is.
     """
     farms = collections.defaultdict(list)
-    for path in workbooks(directory):
+    for path in workbooks(directory, pattern):
         rows = read_sheet(path, FARM_SHEET)
         if rows is None:
             continue
@@ -266,8 +295,14 @@ def crop_classes(label, comment, farm_classes=()):
 
 
 def region_of(source, nsw_sources, vic_sources):
-    """"nsw" / "vic" / "" for a source shapefile name."""
+    """"nsw" / "vic" / "" for a source shapefile name.
+
+    The extra build's NSW shapefiles are named "Lot_<reach>_clean_clip.shp", so a
+    leading "lot_" is dropped before the reach name is matched.
+    """
     name = str(source).lower()
+    if name.startswith("lot_"):
+        name = name[len("lot_"):]
     if name.startswith(tuple(s.lower() for s in nsw_sources)):
         return "nsw"
     if name.startswith(tuple(s.lower() for s in vic_sources)):
@@ -319,11 +354,12 @@ def assign_val_split(df, val_fraction=VAL_FRACTION, random_state=RANDOM_STATE):
 
 
 def build_dataset(dataset_csv, labelled_dir, nsw_sources, vic_sources,
-                  drop_labels, val_fraction=VAL_FRACTION):
+                  drop_labels, val_fraction=VAL_FRACTION,
+                  workbook_pattern=WORKBOOK_PATTERN):
     """Join the crop labels onto the builder's rows and assign the splits."""
     source = pd.read_csv(dataset_csv, dtype={"building_cluster": str, "PFI": str})
-    labels, duplicates = read_crop_labels(labelled_dir)
-    farm_labels = read_farm_labels(labelled_dir)
+    labels, duplicates = read_crop_labels(labelled_dir, workbook_pattern)
+    farm_labels = read_farm_labels(labelled_dir, workbook_pattern)
 
     keys = [crop_key(row.farm_uid, row.image_path) for row in source.itertuples()]
     matched = [key in labels for key in keys]
@@ -414,7 +450,8 @@ def link_imagery(df, dataset_csv, output_dir, mode):
 
 
 def report(df, unmatched_sheet, duplicates, unknown, dropped, args):
-    print(f"{args.dataset} + {args.labelled}/ -> {args.output_dir}/{DATASET_NAME}")
+    print(f"{args.dataset} + {args.labelled}/{args.workbooks} -> "
+          f"{args.output_dir}/{DATASET_NAME}")
     print(f"  {len(df)} labelled crops over {df['farm_uid'].nunique()} farms")
     for label, count in sorted(dropped.items()):
         print(f"  dropped {count} crops labelled {label!r}")
@@ -466,7 +503,10 @@ def report(df, unmatched_sheet, duplicates, unknown, dropped, args):
               f"{sorted(straddling.index)[:5]}")
 
     print("\ncrop label vs the builder's farm-level label:")
-    print(pd.crosstab(df["processed_class"], df["farm_processed_class"]).to_string())
+    if df["farm_processed_class"].notna().any():
+        print(pd.crosstab(df["processed_class"], df["farm_processed_class"]).to_string())
+    else:
+        print("  (the build carries no farm-level label for these crops)")
 
 
 def main():
@@ -476,6 +516,10 @@ def main():
                         help="the dataset builder's dataset.csv to relabel")
     parser.add_argument("--labelled", type=Path, default=DEFAULT_LABELLED,
                         help="directory of completed labelling workbooks")
+    parser.add_argument("--workbooks", default=WORKBOOK_PATTERN,
+                        help="glob selecting the workbooks under --labelled to read, "
+                             "e.g. '2026_08_21_generalisation_extra_*' for the extra "
+                             f"build (default: {WORKBOOK_PATTERN})")
     parser.add_argument("--output-dir", type=Path, default=None,
                         help=f"where to write {DATASET_NAME} and the per-split csvs "
                              "(default: alongside --dataset, so image_path resolves as-is)")
@@ -499,7 +543,7 @@ def main():
 
     df, unmatched_sheet, duplicates, unknown, dropped = build_dataset(
         args.dataset, args.labelled, args.nsw_sources, args.vic_sources,
-        args.drop_labels, args.val_fraction,
+        args.drop_labels, args.val_fraction, args.workbooks,
     )
     if df.empty:
         parser.error(f"no crop in {args.dataset} matched a label in {args.labelled}")

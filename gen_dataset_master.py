@@ -1,16 +1,23 @@
-"""Combine the three FLIP datasets into one master corpus with four named test sets.
+"""Combine the four FLIP datasets into one master corpus with four named test sets.
 
-    1  historical      flip-dataset-processing/output/flip_historical
-                       whole-farm photographs from the original FLIP pipeline
-    2  autocrops       flip-geoimage-dataset-builder/original_new_2026_08_21
-                       building crops cut from those same photographs, farm-level labels
-    3  generalisation  flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation
-                       the case-study subset of those crops, relabelled crop by crop
+    1  historical            flip-dataset-processing/output/flip_historical
+                             whole-farm photographs from the original FLIP pipeline
+    2  autocrops             flip-geoimage-dataset-builder/original_new_2026_08_21
+                             building crops cut from those same photographs, farm-level
+                             labels
+    3  generalisation        flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation
+                             the case-study subset of those crops, relabelled crop by crop
+    4  generalisation_extra  flip-geoimage-dataset-builder/original_new_2026_08_21_generalisation_extra
+                             crops cut from the Lot_* parcels on the case-study reaches
+                             (plus Casino, Corowa, Hanwood, Redlands), relabelled crop by
+                             crop in the same workbooks format
 
-These are not three independent collections. (1) and (3) are two different crops of the
+These are not four independent collections. (1) and (3) are two different crops of the
 same underlying source photographs — 2,398 source-image names in common — and (2) is the
-crop-level relabelling of exactly the imagery (3) holds whole in gen_all_df.csv. Combining
-them therefore has to resolve overlap explicitly rather than assume it away.
+crop-level relabelling of exactly the imagery (3) holds whole in gen_all_df.csv. (4) is
+cut from parcels rather than known farms, records no source photograph and shares no crop
+with (2), but eight of its farm_uids are also in (1). Combining them therefore has to
+resolve overlap explicitly rather than assume it away.
 
 Test wins: a train/val row whose farm_uid or source-image stem appears in any of the four
 test sets is pulled out of train/val. Nothing is deleted — pulled rows go to
@@ -75,20 +82,28 @@ DEFAULT_GENERALISATION = Path(
     "/home/mannixe/FLIP/flip-geoimage-dataset-builder/"
     "original_new_2026_08_21_generalisation"
 )
+DEFAULT_GENERALISATION_EXTRA = Path(
+    "/home/mannixe/FLIP/flip-geoimage-dataset-builder/"
+    "original_new_2026_08_21_generalisation_extra"
+)
 DEFAULT_HISTORICAL = Path(
     "/home/mannixe/FLIP/flip-dataset-processing/output/flip_historical"
 )
-DEFAULT_OUTPUT = Path("original_master_2026_09_04")
+# A new directory rather than original_master_2026_09_04/: that build is what the
+# 2026-09-04 evaluation, the SAM3 relabel and the post-classifier were measured on, and
+# it stays as it was.
+DEFAULT_OUTPUT = Path("original_master_2026_09_18")
 
 # Each source's imagery is copied into its own subfolder, so the two sources that share
 # source photographs cannot collide and each subfolder stays self-contained.
 SUBDIR = {
     "autocrops": "autocrops",
     "generalisation": "generalisation",
+    "generalisation_extra": "generalisation_extra",
     "historical": "historical",
 }
 
-# The union of all three sources' classes. (1) carries 11, (2) adds paddock and
+# The union of all four sources' classes. (1) carries 11, (2) and (4) add paddock and
 # other_industrial, (3) has 10 (no goats). A class its source never assessed is written
 # False, which means "not assessed", not "verified absent" — see the README.
 CLASSES = [
@@ -147,11 +162,17 @@ GROUP_SPEC = {
         "identifier": "image_path", "imagery": "ecw_stem", "level": "image",
         "describe": ("the crop's own path", "`ecw_stem` (the capture)"),
     },
+    "generalisation_extra": {
+        "identifier": "image_path", "imagery": "ecw_stem", "level": "image",
+        "describe": ("the crop's own path", "`ecw_stem` (the capture)"),
+    },
 }
+# The two crop-level relabelled sources, treated alike everywhere below.
+RELABELLED = ["generalisation", "generalisation_extra"]
 
-# The order the three sources are introduced in: the original pipeline first, then the
-# two builds derived from its imagery, so each one can be explained in terms of the last.
-SOURCE_ORDER = ["historical", "autocrops", "generalisation"]
+# The order the four sources are introduced in: the original pipeline first, then the
+# builds derived from its imagery, so each one can be explained in terms of the last.
+SOURCE_ORDER = ["historical", "autocrops", "generalisation", "generalisation_extra"]
 
 # This repository — the one that builds the dataset the README ships inside. Named at
 # the top of the generated README so someone who receives only the dataset directory can
@@ -159,21 +180,24 @@ SOURCE_ORDER = ["historical", "autocrops", "generalisation"]
 THIS_REPO = "https://github.com/emannix/flip-data-labelling"
 THIS_REPO_NAME = "emannix/flip-data-labelling"
 
-# Why the three sources cannot be treated as independent samples. Shared by the generated
+# Why the four sources cannot be treated as independent samples. Shared by the generated
 # README and the summary dashboard, so the two never drift apart.
 NOT_INDEPENDENT = (
     "`autocrops` and `historical` are two different crops of the same underlying source "
     "photographs, and `generalisation` is the crop-level relabelling of exactly the "
-    "imagery `historical/gen_all_df.csv` holds whole. Overlap between them is therefore "
-    "resolved explicitly, not assumed away.\n\n"
+    "imagery `historical/gen_all_df.csv` holds whole. `generalisation_extra` is cut from "
+    "cadastral parcels rather than known farms on those same reaches: it records no "
+    "source photograph and shares no crop with `generalisation`, but eight of its "
+    "`farm_uid`s are also in `autocrops`. Overlap between them is therefore resolved "
+    "explicitly, not assumed away.\n\n"
     "Two consequences worth holding onto:\n\n"
     "- **`test_autocrops` and `test_original` are the same hold-out.** Both are defined "
     "by `farmfinder_test_2022.xlsx` — one at crop level, one at whole-image level. They "
     "share 125 source photographs. Treat them as two views of one test set, not as two "
     "independent ones.\n"
-    "- **`autocrops` and `generalisation` overlap by farm** (24 `farm_uid`s), even "
-    "though they never share a crop file. That is why the test-wins rule below checks "
-    "`farm_uid` as well as the source photograph."
+    "- **`autocrops` overlaps `generalisation` and `generalisation_extra` by farm** "
+    "(24 and 8 `farm_uid`s), even though they never share a crop file. That is why the "
+    "test-wins rule below checks `farm_uid` as well as the source photograph."
 )
 
 # Where each source is built and how its own splits were decided. Written into the
@@ -240,6 +264,39 @@ SOURCE_NOTES = {
             "Because the split is regional, the class mix differs sharply between the "
             "two sides — read the per-class test numbers with the class tables below in "
             "hand rather than assuming train and test are comparable populations."
+        ),
+    },
+    "generalisation_extra": {
+        "repo": "https://github.com/emannix/flip-geoimage-dataset-builder",
+        "repo_name": "emannix/flip-geoimage-dataset-builder",
+        "built_by": (
+            "`extract_imagery_aerial_csv.py` in that repository over the `Lot_*` "
+            "cadastral shapefiles, then relabelled crop-by-crop by "
+            "`gen_dataset_croplevel.py` in **this** one"
+        ),
+        "rows": (
+            "Building crops like `generalisation`'s, but cut from the **cadastral "
+            "parcels** on the case-study reaches rather than from known farms, plus four "
+            "reaches `generalisation` does not cover (Casino, Corowa, Hanwood, "
+            "Redlands). The parcels carry no `Farm_type` and no source photograph, so "
+            "the crop-level workbook label is the only label these rows have ever had. "
+            "Most of it is background — residential, other_industrial and paddock — "
+            "with a few dozen livestock crops."
+        ),
+        "split": (
+            "**Geographic, the same rule as `generalisation`.** NSW reaches to "
+            "train/val, VIC reaches to test. Redlands is in Queensland but is not VIC "
+            "and so sits in the training pool; only nine of its crops are labelled "
+            "anything but Ambiguous.\n\n"
+            "- **train / val — NSW**: Bega, Caniaba, Corowa, Freemans, Hanwood, "
+            "Mangrove, Nowra, Redlands.\n"
+            "- **test — VIC**: Bacchus Marsh, Balliang, Gisborne, Wyuna — cut but **not "
+            "labelled yet**, so this source contributes no test rows. Casino (NSW) is "
+            "likewise cut and unlabelled.\n\n"
+            "Within NSW the train/val cut is farm-grouped and stratified on the farm's "
+            "most common non-background crop class, 20% of farms to val, "
+            "`random_state=42`, drawn independently of `generalisation`'s cut — the two "
+            "builds share no farm, so that costs nothing."
         ),
     },
     "historical": {
@@ -412,8 +469,8 @@ def load_autocrops(root):
     return pd.concat(frames, ignore_index=True)
 
 
-def load_generalisation(root):
-    """(2) — crop-level labels from the workbooks, so each crop is its own group.
+def load_generalisation(root, dataset="generalisation"):
+    """(2) and (4) — crop-level labels from the workbooks, so each crop is its own group.
 
     Its crops sit on the same farms and captures as (1)'s, but every one of them was
     labelled individually, so the crop is what training draws on and the group is the
@@ -421,14 +478,20 @@ def load_generalisation(root):
     geographic and farm-grouped upstream, so no farm straddles train, val and test even
     though group_id no longer says so. farm_uid and ecw_stem stay on every row for anyone
     who wants to regroup by farm and capture.
+
+    (4) is the same layout written by the same script against the extra build; a split
+    csv it has no rows for yet (its VIC test reaches are unlabelled) is skipped.
     """
     frames = []
     for split in ("train", "val", "test"):
         name = f"relabelled_{split}_df.csv"
+        raw = read_csv(root / name)
+        if raw.empty:
+            continue
         frames.append(normalise(
-            read_csv(root / name), "generalisation", root, name, split, "crop",
+            raw, dataset, root, name, split, "crop",
             image_path="image_path", source_image_path="source_image_path",
-            source_image_name="filename", **group_args("generalisation"),
+            source_image_name="filename", **group_args(dataset),
         ))
     return pd.concat(frames, ignore_index=True)
 
@@ -492,11 +555,11 @@ def assign_splits(df, val_fraction, random_state):
 
     generalisation_train = set(
         df.loc[
-            (df["source_dataset"] == "generalisation")
+            df["source_dataset"].isin(RELABELLED)
             & df["source_split"].isin(["train", "val"]),
             "source_image_stem",
         ]
-    )
+    ) - {""}
     gen_all = df["source_file"] == "gen_all_df.csv"
     superseded = gen_all & df["source_image_stem"].isin(generalisation_train)
 
@@ -506,6 +569,8 @@ def assign_splits(df, val_fraction, random_state):
         ("autocrops", "test", "test_autocrops"),
         ("generalisation", "train", "train"), ("generalisation", "val", "val"),
         ("generalisation", "test", "test_autocrop_gen_vic"),
+        ("generalisation_extra", "train", "train"), ("generalisation_extra", "val", "val"),
+        ("generalisation_extra", "test", "test_autocrop_gen_vic"),
         ("historical", "train", "train"), ("historical", "val", "val"),
         ("historical", "hpai/train", "train"), ("historical", "hpai/val", "val"),
         ("historical", "test", "test_original"),
@@ -791,6 +856,8 @@ def unmatched_inventory(df, args):
         ("autocrops", args.autocrops, lambda r: autocrops_reasons(r)),
         ("generalisation", args.generalisation,
          lambda r: generalisation_reasons(r, args.labelled)),
+        ("generalisation_extra", args.generalisation_extra,
+         lambda r: generalisation_reasons(r, args.labelled)),
     ]
     records = []
     for name, root, reasons_for in sources:
@@ -900,14 +967,15 @@ def readme(df, totals, args, missing, unmatched):
     ]
 
     lines = [
-        "# FLIP master dataset — original_master_2026_09_04",
+        f"# FLIP master dataset — {args.output_dir.name}",
         "",
-        f"Built by `gen_dataset_master.py` on {pd.Timestamp.today():%Y-%m-%d} from three "
-        "existing datasets. Every row records where it came from and how it was placed.",
+        f"Built by `gen_dataset_master.py` on {pd.Timestamp.today():%Y-%m-%d} from "
+        f"{len(sources)} existing datasets. Every row records where it came from and how "
+        "it was placed.",
         "",
         f"**Built from:** [{THIS_REPO_NAME}]({THIS_REPO}) — `gen_dataset_master.py` "
         "assembles this directory, `gen_dataset_croplevel.py` produces the crop-level "
-        "labels one of the three sources depends on, and `labelled_sheets/` holds the "
+        "labels two of the sources depend on, and `labelled_sheets/` holds the "
         "labelling workbooks those came from. Start there to rebuild or extend this "
         "dataset.",
         "",
@@ -970,9 +1038,11 @@ def readme(df, totals, args, missing, unmatched):
         "| split | rows | groups | built from |",
         "|---|---|---|---|",
         f"| `train` | {counts['train']:,} | {groups.get('train', 0):,} | autocrops train + "
-        "generalisation train + historical train + ~80% of historical hpai |",
+        "generalisation train + generalisation_extra train + historical train + ~80% of "
+        "historical hpai |",
         f"| `val` | {counts['val']:,} | {groups.get('val', 0):,} | autocrops val + "
-        "generalisation val + historical val + ~20% of historical hpai |",
+        "generalisation val + generalisation_extra val + historical val + ~20% of "
+        "historical hpai |",
         f"| `train_overlap` | {counts['train_overlap']:,} | "
         f"{groups.get('train_overlap', 0):,} | train rows pulled for reaching a test set |",
         f"| `val_overlap` | {counts['val_overlap']:,} | {groups.get('val_overlap', 0):,} | "
@@ -980,8 +1050,9 @@ def readme(df, totals, args, missing, unmatched):
         f"| `test_autocrops` | {counts['test_autocrops']:,} | "
         f"{groups.get('test_autocrops', 0):,} | autocrops `test_df.csv` |",
         f"| `test_autocrop_gen_vic` | {counts['test_autocrop_gen_vic']:,} | "
-        f"{groups.get('test_autocrop_gen_vic', 0):,} | generalisation "
-        "`relabelled_test_df.csv` — VIC reaches, crop-level labels |",
+        f"{groups.get('test_autocrop_gen_vic', 0):,} | generalisation and "
+        "generalisation_extra `relabelled_test_df.csv` — VIC reaches, crop-level labels "
+        "(generalisation_extra's VIC reaches are not labelled yet) |",
         f"| `test_gen_original` | {counts['test_gen_original']:,} | "
         f"{groups.get('test_gen_original', 0):,} | historical `gen_all_df.csv`, less the "
         "images whose crops are in generalisation train/val |",
@@ -1059,7 +1130,8 @@ def readme(df, totals, args, missing, unmatched):
         "alone merged them and produced groups of up to 37. Splitting on the capture as "
         "well keeps each group to a single photograph of a single place.",
         "",
-        "**`generalisation` groups by image, not by farm.** Its crops sit on the same "
+        "**`generalisation` and `generalisation_extra` group by image, not by farm.** "
+        "`generalisation`'s crops sit on the same "
         "farms and captures as `autocrops`, but every one of them was labelled "
         "individually in the workbooks, so the crop is what training draws on. Split "
         "integrity does not rest on that: this source's own split is geographic and "
@@ -1067,8 +1139,9 @@ def readme(df, totals, args, missing, unmatched):
         "`group_id` no longer says so. `farm_uid` and `ecw_stem` are on every row for "
         "anyone who wants to regroup it by farm and capture.",
         "",
-        "**Why the dataset is in the key.** `autocrops` and `generalisation` share 24 "
-        "`farm_uid`s, and a bare identifier would merge groups across two sources whose "
+        "**Why the dataset is in the key.** `autocrops` shares 24 `farm_uid`s with "
+        "`generalisation` and 8 with `generalisation_extra`, and a bare identifier would "
+        "merge groups across sources whose "
         "splits were assigned independently. **Groups never span datasets.** The raw "
         "`farm_uid` is still on every row, so merging them later stays a deliberate act.",
         "",
@@ -1089,12 +1162,13 @@ def readme(df, totals, args, missing, unmatched):
         f"{', '.join('`' + c + '`' for c in CLASSES)}.",
         "",
         "Sources disagree on which classes they carry — `autocrops` has 11, "
-        "`generalisation` 13 (it adds `paddock` and `other_industrial`), `historical` 10 "
-        "(no `goats`). A class a source never assessed is written **`False`**. That means "
-        "*not assessed*, not *verified absent*. `binary_paddock` and "
-        "`binary_other_industrial` are only ever `True` on `generalisation` rows, so "
-        "treating their `False` values as negatives will train against the other two "
-        "sources rather than with them.",
+        "`generalisation` and `generalisation_extra` 13 (they add `paddock` and "
+        "`other_industrial`), `historical` 10 (no `goats`). A class a source never "
+        "assessed is written **`False`**. That means *not assessed*, not *verified "
+        "absent*. `binary_paddock` and `binary_other_industrial` are only ever `True` on "
+        "`generalisation` and `generalisation_extra` rows, so treating their `False` "
+        "values as negatives will train against the other two sources rather than with "
+        "them.",
         "",
         f"`label_status` is `labelled` for {int((df['label_status'] == 'labelled').sum()):,} "
         "rows. The rest carry a placeholder class from `gen_all_df.csv` and no positive "
@@ -1114,7 +1188,8 @@ def readme(df, totals, args, missing, unmatched):
         "",
         "**Provenance** (on every file, standalone and combined alike)",
         "",
-        "- `source_dataset` — `autocrops` | `generalisation` | `historical`",
+        "- `source_dataset` — `autocrops` | `generalisation` | `generalisation_extra` "
+        "| `historical`",
         "- `source_dataset_path` — the directory it was read from",
         "- `source_file` — the csv within it",
         "- `source_split` — that file's own notion of the split, verbatim",
@@ -1141,7 +1216,8 @@ def readme(df, totals, args, missing, unmatched):
         "was cut from, where the source recorded one",
         "- `source_image_name` / `source_image_stem` — the photograph's name; the stem "
         "(lower-cased, extension stripped) is the key all three sources join on",
-        "- `farm_uid` — `autocrops` and `generalisation` only; `historical` has none",
+        "- `farm_uid` — `autocrops`, `generalisation` and `generalisation_extra`; "
+        "`historical` has none",
         "",
         "**Labels** — `processed_class` (the primary class), `crop_classes` "
         "(comma-separated, canonical order), `n_classes`, and the 13 `binary_` columns.",
@@ -1151,19 +1227,20 @@ def readme(df, totals, args, missing, unmatched):
         "",
         "## what is not in the labelled set",
         "",
-        f"`{UNMATCHED_NAME}` catalogues every image under the three source roots that no "
+        f"`{UNMATCHED_NAME}` catalogues every image under the source roots that no "
         f"row of this dataset points at — {len(unmatched):,} files — and says why each one "
         "sits outside the labelled set. Most are copied in anyway, so this directory "
-        "holds every usable picture the three builds produced and the csv is the index to "
+        "holds every usable picture the builds produced and the csv is the index to "
         "the unlabelled remainder.",
         "",
         "| reason | files | copied | size | what it is |",
         "|---|---|---|---|---|",
     ]
     explain = {
-        "unlabelled": "generalisation crops whose reach has not been relabelled yet — "
-                      "the largest pool of work still to do",
-        "ambiguous": "generalisation crops a labeller looked at and could not call",
+        "unlabelled": "generalisation / generalisation_extra crops whose reach has not "
+                      "been relabelled yet — the largest pool of work still to do",
+        "ambiguous": "generalisation / generalisation_extra crops a labeller looked at "
+                     "and could not call",
         "excluded_upstream": "named in `farmfinder_train_2022.xlsx`, the 2022 "
                              "train_exceptions hold-out, so the builds put them in no split",
         "blank_or_nodata": "cut by the builder, then dropped by its own crop-quality "
@@ -1233,6 +1310,8 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--autocrops", type=Path, default=DEFAULT_AUTOCROPS)
     parser.add_argument("--generalisation", type=Path, default=DEFAULT_GENERALISATION)
+    parser.add_argument("--generalisation-extra", type=Path,
+                        default=DEFAULT_GENERALISATION_EXTRA)
     parser.add_argument("--historical", type=Path, default=DEFAULT_HISTORICAL)
     parser.add_argument("--labelled", type=Path, default=Path("labelled_sheets"),
                         help="the labelling workbooks, read only to say why an unmatched "
@@ -1254,6 +1333,7 @@ def main():
     df = pd.concat([
         load_autocrops(args.autocrops),
         load_generalisation(args.generalisation),
+        load_generalisation(args.generalisation_extra, "generalisation_extra"),
         load_historical(args.historical),
     ], ignore_index=True)
     totals = df.groupby(["source_dataset", "source_file"], sort=False).size().to_dict()
