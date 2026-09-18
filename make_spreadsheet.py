@@ -194,6 +194,11 @@ def filter_sources(rows: list[dict], sources: list[str]) -> list[dict]:
     return [row for row in rows if str(row["source"]).lower().startswith(wanted)]
 
 
+def optional_path(value: str) -> Path | None:
+    """`--exclude-labelled ""` means no exclusion; Path("") would silently mean the cwd."""
+    return Path(value) if value else None
+
+
 def labelled_farms(directory: Path) -> set[str]:
     """Every Farm UID and Farm PFI appearing in a workbook under `directory`.
 
@@ -455,7 +460,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--exclude-labelled",
-        type=Path,
+        type=optional_path,
         default=DEFAULT_LABELLED,
         help="directory of completed labelling workbooks whose farms are already done "
         "(pass an empty string to keep everything)",
@@ -488,7 +493,8 @@ def main() -> None:
 
     print(f"{args.input} -> {args.output}")
     print(f"  sources: {', '.join(sorted({row['source'] for row in rows}))}")
-    print(f"  excluded: {len(done)} farm ids already labelled in {args.exclude_labelled}")
+    if args.exclude_labelled:
+        print(f"  excluded: {len(done)} farm ids already labelled in {args.exclude_labelled}")
     print(f"  {FARM_SHEET}: {len(farms)} farms x {len(labels)} labels (+ confidence)")
     print(f"  {IMAGE_SHEET}: {len(rows)} images, {len(image_options)} dropdown options")
 

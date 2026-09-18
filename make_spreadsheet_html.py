@@ -39,7 +39,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from make_spreadsheet import DEFAULT_INPUT, DEFAULT_LABELLED, DEFAULT_SOURCES, labelled_farms
+from make_spreadsheet import DEFAULT_INPUT, DEFAULT_LABELLED, DEFAULT_SOURCES, labelled_farms, optional_path
 
 DEFAULT_OUTPUT_NAME = "review.html"  # written beside dataset.csv unless --output says otherwise
 DEFAULT_THUMBNAIL = 1000
@@ -425,7 +425,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--exclude-labelled",
-        type=Path,
+        type=optional_path,
         default=DEFAULT_LABELLED,
         help="directory of completed labelling workbooks whose farms are already done "
         "(pass an empty string to keep everything)",
@@ -457,7 +457,8 @@ def main() -> None:
 
     print(f"{args.input} -> {output}")
     print(f"  sources: {', '.join(sorted({row['source'] for row in rows}))}")
-    print(f"  excluded: {len(done)} farm ids already labelled in {args.exclude_labelled}")
+    if args.exclude_labelled:
+        print(f"  excluded: {len(done)} farm ids already labelled in {args.exclude_labelled}")
     print(f"  {len(farms)} farms, {len(rows)} images, {sum(bool(meta) for meta in metadata.values())} with metadata")
     errors = build_thumbnails(rows, build_dir, args.thumbnail, args.quality, args.workers, args.force)
     for error in errors[:20]:

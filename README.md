@@ -202,6 +202,24 @@ the top of the build directory, beside `dataset.csv`.
     python make_spreadsheet_html.py --input $TEST --sources vic_pics
     xdg-open /home/mannixe/FLIP/flip-geoimage-dataset-builder/output_gen_extra_test/review.html
 
+For the two earlier builds the page is more useful covering the whole folder than the
+farms still to label, so pass `--sources` with no values and turn the `labelled_sheets/`
+exclusion off:
+
+    BUILDER=/home/mannixe/FLIP/flip-geoimage-dataset-builder
+
+    python make_spreadsheet_html.py --sources --exclude-labelled "" \
+        --input $BUILDER/original_new_2026_08_21_generalisation/dataset.csv
+    python make_spreadsheet_html.py --sources --exclude-labelled "" \
+        --input $BUILDER/original_new_2026_08_21_generalisation_extra/dataset.csv
+
+    original_new_2026_08_21_generalisation/review.html         749 farms  2913 crops  ~600 MB of previews
+    original_new_2026_08_21_generalisation_extra/review.html  1420 farms  2622 crops  ~485 MB of previews
+    output_gen_extra_test/review.html                          301 farms  3312 crops  ~690 MB of previews
+
+Add the workbook's `--sources` (and drop `--exclude-labelled ""`) to get a page that
+matches one workbook farm for farm instead.
+
 Browsers cannot show the JPEG-in-GeoTIFF crops, so each one gets a JPEG preview beside it
 (`..._building_0.tif` -> `..._building_0.jpg`) that the page references by relative path;
 nothing is copied anywhere else, and the page and previews travel with the build directory
