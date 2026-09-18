@@ -671,10 +671,13 @@ that into this repository.
 ## `gen_sam3_postprocess_relabel.py` — the `sam3_*.csv` files
 
     .venv/bin/python gen_sam3_postprocess_relabel.py
+    .venv/bin/python gen_sam3_postprocess_relabel.py --master original_master_2026_09_18
 
-For every csv in `original_master_2026_09_04/` this writes a `sam3_`-prefixed copy beside
-it — `sam3_train_df.csv` is `train_df.csv` plus SAM3 columns, same rows in the same order
-— and a `sam3_README.md` tallying the join. The originals are not touched. The join is on
+The default `--master` is `original_master_2026_09_04`, the build the numbers below and the
+post-classifier were measured on; the current build is a `--master` away and is covered at
+the end of this section. For every csv in the master directory this writes a
+`sam3_`-prefixed copy beside it — `sam3_train_df.csv` is `train_df.csv` plus SAM3 columns,
+same rows in the same order — and a `sam3_README.md` tallying the join. The originals are not touched. The join is on
 the crop's own relative path, so every `autocrops` and `generalisation` row lands and the
 `historical` whole-farm photographs, which were never cut into crops, come through with
 `sam3_available = False` and empty SAM3 columns.
@@ -695,6 +698,41 @@ Columns, all prefixed `sam3_`: the pipeline's `{prompt}_{count,mean_area_m2,
 total_area_m2,max_score}`, a `{prompt}_area_frac` normalised by the crop's area so crops of
 different sizes and resolutions compare, the crop's size and resolution, and the gate
 summaries `gate_score`, `gate_count`, `gate_area_frac` and the boolean `building`.
+
+### over `original_master_2026_09_18`
+
+    .venv/bin/python gen_sam3_postprocess_relabel.py --master original_master_2026_09_18
+
+`--master` points the same join at the current build (`--sam3` moves the detections),
+writing 11 `sam3_*.csv` and a `sam3_README.md` into `original_master_2026_09_18/`. Three of
+the five sources are covered — `autocrops` from the `training` run, `generalisation` and
+`generalisation_extra` from their own — which is 23,449 of the 26,985 `dataset.csv` rows.
+`historical` was never cut into crops. The VicPICs supplement `generalisation_extra_test`
+has no run under `sam3_results/` at all, so its 7,408 rows come through
+`sam3_available = False`; none of them are relabelled yet either, so they all sit in
+`unmatched_to_labels.csv` and nothing labelled is missing a feature. The script already
+expects that run (`SOURCE_TO_EXTRACT`), so scoring the release with `sam3_pipeline.py
+--extract-type generalisation_extra_test` is all it takes to pick it up.
+
+The relabel lands on 10,275 rows of `dataset.csv` — 7,761 of the 18,727 training crops,
+1,849 of the 4,537 validation crops, 592 of `test_autocrops`, 60 of `train_overlap` and 13
+of `val_overlap`. **Every one of them is `autocrops`**, and half of that source moves:
+10,275 of its 20,803 rows. `generalisation` and `generalisation_extra` are crop-level human
+labels, which the relabel never touches, and `historical` is farm-level but has no SAM3 row
+to gate on. `test_autocrop_gen_vic` is human-labelled crop by crop, so it is untouched and
+stays comparable with the 2026-09-04 build's copy row for row.
+
+The gate check now runs over 2,646 human-labelled crops rather than 1,629, and reads worse
+for it: "no gate detection means paddock" holds at precision 0.897 and recall 0.812 overall,
+which is 0.961 / 0.831 on `generalisation`, unchanged, and 0.755 / 0.764 on
+`generalisation_extra` — a quarter of its no-detection crops carry a non-paddock label,
+these being crops cut from cadastral parcels rather than known farms. Nothing relabelled is
+a parcel crop, though: the gate is measured on the two crop-level sources and applied only to
+`autocrops`, which is farm-centred like `generalisation`, so 0.961 / 0.831 is the figure that
+describes the rows that actually change. The `generalisation_extra` number says the gate
+degrades on parcel crops, which will matter the day a parcel-cut source enters the pool
+farm-labelled. The relabel is applied at the same 0.5 threshold either way; `--gate-min-score`
+moves the bar, and `sam3_relabel` plus the `*_pre_sam3` columns undo it.
 
 ## `gen_post_classifier.py` — post-classifiers on top of the scored models
 

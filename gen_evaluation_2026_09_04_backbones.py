@@ -11,7 +11,10 @@ were confounded. The 2026-09-11 sweep under `other_backbones/` retrains the *sam
 probe on four larger backbones, all on the master split with the same recipe (60 epochs,
 early stopping on validation accuracy, cosine SGD), so the page can ask two things
 separately: what the backbone is worth to a linear probe, and how much of ComFe's lead
-survives once its probe rival sits on the same ViT-L features.
+survives once its probe rival sits on the same ViT-L features. A second ComFe, launched
+2026-09-18 under `other_backbones_comfe/` on DINOv3 ViT-L/16, carries the best probe
+backbone under the ComFe head, so the two heads can now be read on two backbones each
+rather than one.
 
 *The backbones.* Every model is a linear probe on frozen features unless it says ComFe.
 
@@ -21,13 +24,17 @@ survives once its probe rival sits on the same ViT-L features.
     lin_sat    DINOv3 ViT-L/16, satellite weights   SAT-493M aerial/satellite
     lin_radio  C-RADIOv4 SO400M                     agglomerative distillation  relaunched 2026-09-18
     comfe_l    ComFe on DINOv2 ViT-L/14 w/ reg.     LVD-142M web images        the 2026-09-04 `comfe_m`
+    comfe_v3   ComFe on DINOv3 ViT-L/16             LVD-1689M web images       launched 2026-09-18
 
 `lin_s` and `comfe_l` are the 2026-09-04 runs re-read, so their numbers repeat the earlier
 dashboard exactly; only the keys are renamed so that the key names the backbone. The
 C-RADIOv4 runs of 2026-09-11 all stopped while fetching the checkpoint from Hugging Face
 and left no prediction, checkpoint or error; they were relaunched on 2026-09-18 as batch
 `384a1` and all four seeds have now saved a test prediction. `lin_radio`'s `match` names
-that batch, so the four abandoned directories are not read at all.
+that batch, so the four abandoned directories are not read at all. `comfe_v3` is the only
+family launched fresh here: its four seeds started at 14:16 on 2026-09-18 and ComFe takes
+about four hours a run, so the first pass over this script will report them as still
+training and the page fills in on a rerun.
 
 *Same truth, same subset.* `test_autocrop_gen_vic.csv`, 1,146 crops over the two VIC
 reaches, and the same well-sampled class subset as the two earlier pages - a class must
@@ -120,13 +127,16 @@ from gen_evaluation_2026_09_04 import (
 OUTPUT = Path("output_eval_2026_09_04_backbones")
 SWEEP = VIEW / "flip_2026_09_04"
 BACKBONES = SWEEP / "other_backbones"
+BACKBONES_COMFE = SWEEP / "other_backbones_comfe"
 
-# A run with nothing saved whose log has not moved for this long is dead, not training.
-# The sweep's live runs write to main.log every few minutes; the abandoned 2026-09-11
-# C-RADIOv4 logs stopped at the checkpoint download and are no longer matched.
+# A run with nothing saved that has written nothing for this long is dead, not training.
+# The probes write to main.log every few minutes, but a ComFe run logs nothing at all
+# between "Starting training!" and the checkpoint selection about four hours later, so
+# liveness is read off the newest of the log and the tensorboard event files rather than
+# off main.log alone. The abandoned 2026-09-11 C-RADIOv4 runs left neither.
 STALE_HOURS = 24
 
-# The six families, in display order. `match` is a substring of the run directory name
+# The seven families, in display order. `match` is a substring of the run directory name
 # and carries the launch-batch suffix, because `dinov3_linear_finetune_vitl16` is a prefix
 # of `dinov3_linear_finetune_vitl16_sat`. `alias` is the key the same runs had on the
 # 2026-09-04 dashboard, where there is one.
@@ -215,16 +225,32 @@ MODELS = [
         "runs": SWEEP,
         "match": "comfe_dinov2_vitlwr_master_1-5",
     },
+    {
+        "key": "comfe_v3",
+        "slot": 7,
+        "label": "ComFe, DINOv3 ViT-L/16",
+        "detail": "ComFe head on facebook/dinov3-vitl16-pretrain-lvd1689m, the same backbone as lin_v3; launched 2026-09-18, 50 epochs on the master split like comfe_l",
+        "backbone": "DINOv3 ViT-L/16",
+        "pretraining": "LVD-1689M web images",
+        "params": "300M",
+        "alias": None,
+        "classes": MASTER_CLASSES,
+        "space": "test",
+        "runs": BACKBONES_COMFE,
+        "match": "comfe_dinov3_vitl16_master_1-5",
+    },
 ]
 
 # The gallery is picked on the ComFe, as on the earlier page, so the same farms come up.
-REFERENCE_KEYS = ["comfe_l", "lin_l", "lin_s", "lin_v3", "lin_sat", "lin_radio"]
+REFERENCE_KEYS = ["comfe_l", "lin_l", "lin_s", "lin_v3", "lin_sat", "lin_radio", "comfe_v3"]
 
 # The reference palette's categorical slots, light value first. The two re-read families
 # keep the colours they had on the 2026-09-04 page (slots 5 and 6), so pink is still the
 # ViT-S probe and dark green is still ComFe across the two dashboards; the four new
-# backbones take slots 1 to 4. The base module's chart routines read their series
-# colours off its own SERIES table, so it is pointed at this one.
+# backbones take slots 1 to 4, and the DINOv3 ComFe takes slot 7, the purple the cascades
+# had on the 2026-09-04 page - no cascade appears here, so the colour is free and no model
+# changes colour between the two dashboards. The base module's chart routines read their
+# series colours off its own SERIES table, so it is pointed at this one.
 SERIES = {
     "lin_s": ("#e87ba4", "#d55181"),
     "lin_l": ("#2a78d6", "#3987e5"),
@@ -232,6 +258,7 @@ SERIES = {
     "lin_sat": ("#1baf7a", "#199e70"),
     "lin_radio": ("#eda100", "#c98500"),
     "comfe_l": ("#008300", "#008300"),
+    "comfe_v3": ("#4a3aa7", "#9085e9"),
 }
 base.SERIES = SERIES
 
@@ -260,12 +287,19 @@ def log_span(run_dir: Path) -> tuple[float | None, float | None]:
     return first, last
 
 
+def last_write(run_dir: Path) -> float | None:
+    """When the run last wrote anything: its log or its tensorboard event files."""
+    written = [run_dir / "main.log", *(run_dir / "tensorboard").rglob("events.out.tfevents.*")]
+    stamps = [path.stat().st_mtime for path in written if path.exists()]
+    return max(stamps) if stamps else None
+
+
 def run_state(run_dir: Path) -> str:
-    """`scored`, `training` or `dead`: dead is nothing saved and a log gone quiet."""
+    """`scored`, `training` or `dead`: dead is nothing saved and a run gone quiet."""
     if predictions_dir(run_dir):
         return "scored"
-    log = run_dir / "main.log"
-    if log.exists() and time.time() - log.stat().st_mtime < STALE_HOURS * 3600:
+    moved = last_write(run_dir)
+    if moved is not None and time.time() - moved < STALE_HOURS * 3600:
         return "training"
     return "dead"
 
@@ -557,12 +591,13 @@ def build_page(
             f"prediction and the charts fill in.</div>"
         )
 
-    ready = [m for m in scored if m["key"] != "comfe_l"]
-    probe_note = (
-        f"{len(ready)} linear probe{'s' if len(ready) != 1 else ''} and ComFe"
-        if any(m["key"] == "comfe_l" for m in scored)
-        else f"{len(ready)} linear probes"
-    )
+    probes = [m for m in scored if not m["key"].startswith("comfe")]
+    comfes = [m for m in scored if m["key"].startswith("comfe")]
+    probe_note = f"{len(probes)} linear probe{'s' if len(probes) != 1 else ''}"
+    if comfes:
+        probe_note += (
+            " and ComFe" if len(comfes) == 1 else f" and {len(comfes)} ComFe backbones"
+        )
 
     sections = [
         f"""
@@ -576,9 +611,10 @@ def build_page(
   lost to ComFe on livestock, but the probe sat on DINOv2 ViT-S/14 and ComFe on ViT-L/14
   with registers, so the head and the backbone were confounded. Here the same probe is
   retrained on ComFe&rsquo;s own ViT-L backbone, on DINOv3 ViT-L/16 with web and with
-  satellite weights, and on C-RADIOv4. Two questions, kept apart: what a bigger or
-  domain-matched backbone is worth to a linear probe, and how much of ComFe&rsquo;s lead
-  is its head once the backbone is held fixed. Average precision by class, as before,
+  satellite weights, and on C-RADIOv4, and ComFe itself is retrained on DINOv3 ViT-L/16,
+  so each head is now read on more than one backbone. Two questions, kept apart: what a
+  bigger or domain-matched backbone is worth to a linear probe, and how much of
+  ComFe&rsquo;s lead is its head once the backbone is held fixed. Average precision by class, as before,
   because the classes are rare and every model emits a ranking rather than a decision.</p>
 </header>
 """,
@@ -801,16 +837,23 @@ def build_page(
     and <code>other_industrial</code> exist only in the 397. The linear probes share one
     recipe &mdash; frozen backbone, one linear layer on the last block, sigmoid outputs and
     BCE, SGD with a cosine schedule, at most 60 epochs with early stopping on validation
-    accuracy, four seeds &mdash; and differ only in the backbone. ComFe is the 2026-09-04
-    run, 50 epochs on DINOv2 ViT-L/14 with registers.</p>
+    accuracy, four seeds &mdash; and differ only in the backbone. The two ComFe families
+    share their own recipe &mdash; frozen backbone, ComFe head, 50 epochs, four seeds
+    &mdash; and likewise differ only in the backbone: <code>comfe_l</code> is the
+    2026-09-04 run on DINOv2 ViT-L/14 with registers, <code>comfe_v3</code> the
+    2026-09-18 run on DINOv3 ViT-L/16. Each ComFe therefore has a linear probe on its own
+    backbone to be read against &mdash; <code>lin_l</code> and <code>lin_v3</code>.</p>
     <p><strong>Two families are re-read.</strong> <code>lin_s</code> is the 2026-09-04
     <code>lin_m</code> and <code>comfe_l</code> its <code>comfe_m</code>, from the same run
     directories, so their numbers repeat the earlier dashboard exactly; they are renamed so
-    the key names the backbone. The other families are read from
-    <code>{escape(BACKBONES.name)}/</code> under the same view.</p>
+    the key names the backbone. The four new probes are read from
+    <code>{escape(BACKBONES.name)}/</code> and <code>comfe_v3</code> from
+    <code>{escape(BACKBONES_COMFE.name)}/</code>, under the same view.</p>
     <p><strong>Dead runs.</strong> A run with no saved prediction is <em>training</em> if
-    its <code>main.log</code> changed in the last {STALE_HOURS} hours and <em>dead</em>
-    otherwise. C-RADIOv4's first four runs, launched 2026-09-11, ended at the Hugging Face
+    its <code>main.log</code> or a tensorboard event file changed in the last
+    {STALE_HOURS} hours and <em>dead</em> otherwise. Both are checked because a ComFe run
+    logs nothing between the start of training and the checkpoint selection four hours
+    later, while its event file keeps growing. C-RADIOv4's first four runs, launched 2026-09-11, ended at the Hugging Face
     checkpoint download with no error, checkpoint or event file; they were relaunched on
     2026-09-18 and all four seeds of that batch have saved a prediction. This page reads the
     relaunched batch only, so the abandoned directories are left out rather than reported
