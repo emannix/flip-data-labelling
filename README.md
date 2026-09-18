@@ -139,6 +139,41 @@ What they write, and how big each one is:
     2026_08_21_generalisation_extra_relabel_farm_and_image_gisborne.xlsx        69 farms   145 images
     2026_08_21_generalisation_extra_relabel_farm_and_image_wyuna.xlsx          131 farms   305 images
 
+## Generalisation extra test (VicPICs supplement, September 2026)
+
+A third builder run, `output_gen_extra_test/`, over the September 2026 VicPICs supplement:
+314 Victorian PIC farms cropped from the VIC training rasters, sheep/poultry/pigs only, and
+wholly held out (see the builder's README, "generalisation_extra_test"). The builder only
+writes `dataset.csv` once the crops are back on the workstation, so run that step there
+first if the directory has no csv yet:
+
+    cd /home/mannixe/FLIP/flip-geoimage-dataset-builder
+    .venv/bin/python extract_imagery_aerial_csv.py --output-dir output_gen_extra_test \
+        --csv output_gen_extra_test/dataset.csv --keep-drop-classes
+
+That drops the 784 blank crops (of 4,096) and leaves 3,312 over 301 farms. The single
+`source` value is `Vic_PICs_generalisation_extras_sept26`, so `--sources vic_pics` keeps
+everything; none of its farms appear in `labelled_sheets/`, and `source_image_path` is
+blank throughout because these crops have no source photograph.
+
+    TEST=/home/mannixe/FLIP/flip-geoimage-dataset-builder/output_gen_extra_test/dataset.csv
+
+    python make_spreadsheet.py \
+        --input $TEST \
+        --sources vic_pics \
+        --output output/2026_09_18_generalisation_extra_test_relabel_farm_and_image_vicpics.xlsx
+
+    2026_09_18_generalisation_extra_test_relabel_farm_and_image_vicpics.xlsx   301 farms  3312 images
+
+Two things to know when labelling it. Every farm was cropped from *every* indexed raster
+over it, not only its named `WMS_NAME` capture, so 179 of the 301 farms carry two to four
+epochs of the same buildings; the csv's `wms_match` column marks the named one, and 32
+farms have no crop from it at all because that raster (wimmera 2016) is not on the share.
+And 45 of the farms overlap a farm in the training join, 35 of them by more than half
+(`training_overlap_frac` in the csv), so they are not all new farms. The review page
+below makes both visible.
+
+
 ## options
 
 - `--input` — `dataset.csv`, or one of the original flat `.xlsx` relabelling sheets.
@@ -146,6 +181,46 @@ What they write, and how big each one is:
   `source` shapefile name. Pass with no values to keep everything.
 - `--exclude-labelled` — directory of completed workbooks whose farms are already done
   (default `labelled_sheets/`). Pass `""` to keep everything.
+
+# reviewing farms in the browser
+
+`make_spreadsheet_html.py` renders the farms of a workbook as one HTML page so they can be
+looked at without opening the GeoTIFFs one at a time. It takes the same `--input`,
+`--sources` and `--exclude-labelled` as `make_spreadsheet.py` and selects the same farms
+in the same order, so row *n* of the "Farm labels" sheet is farm *n* on the page. For each
+farm it shows (1) the builder's `{farm_uid}_metadata.json` — stock counts, PIC, property
+attributes, WMS raster — with the empty fields dropped and a satellite map link when the
+farm has a Lat/Long, and (2) every crop in `dataset.csv` for that farm, grouped by the
+raster it was cut from, the farm's own WMS raster first and then by capture date. A filter
+box at the top matches on the uid, PIC, PFI, class or any metadata value; clicking a crop
+opens it large in a lightbox on the same page, the arrow keys step through the farm's
+crops, and Esc closes it.
+
+The page lives with the data rather than in this repo: it is written as `review.html` at
+the top of the build directory, beside `dataset.csv`.
+
+    python make_spreadsheet_html.py --input $TEST --sources vic_pics
+    xdg-open /home/mannixe/FLIP/flip-geoimage-dataset-builder/output_gen_extra_test/review.html
+
+Browsers cannot show the JPEG-in-GeoTIFF crops, so each one gets a JPEG preview beside it
+(`..._building_0.tif` -> `..._building_0.jpg`) that the page references by relative path;
+nothing is copied anywhere else, and the page and previews travel with the build directory
+when it is tarred or synced. Re-running only makes the previews that are missing, so a
+rebuild of the page after `labelled_sheets/` changes takes a few seconds. The builder's
+own tooling globs `*.tif` and `*_metadata.json`, so the previews do not disturb it. For
+the 3,312 crops above the previews come to about 690 MB at the default size and take
+25 s on 8 processes; only the rows of `dataset.csv` are shown, the builder having already
+dropped the blank crops.
+
+- `--output` — write the html somewhere else (the previews stay beside the crops and are
+  referenced relatively, so it still works from another directory on the same machine).
+- `--thumbnail` — longest side of each preview in px (default 1000; the crops are 2001).
+- `--quality` — JPEG quality (default 82); `--workers` — preview processes (default 8).
+- `--force` — remake previews that already exist, e.g. after changing `--thumbnail`.
+- `--embed` — inline the previews as data URIs for a single self-contained file; at the
+  default size that is most of a GB for a whole build, so pair it with a small
+  `--thumbnail` or use it on one reach at a time.
+- `--title` — page title (default `<build directory> review`).
 
 # building the crop-level dataset
 
