@@ -545,7 +545,7 @@ wrote to `output_eval_2026_09_04/scores_crop.csv`, and derives three models per 
   between a model score and a detection can be learned. `--stacker {logistic,xgboost,both}`
   chooses; the default is both, side by side. Produce them with the builder's `*_predict_percrop.yaml` config pointed at
   `val_df.csv` (`group_pool: null`, so the saved index is the csv's row order), drop the
-  runs under `comfe-run-flip/view/flip_2026_09_04_percrop/` (or `--split-runs`), and
+  runs under `comfe-run-flip/view/flip_2026_09_04_postclassifier_test/` (or `--split-runs`), and
   `--fit-on auto` picks them up; `--fit-on both` reports both fits side by side.
 
 Everything is scored with the evaluation script's own functions — same hold-out, same

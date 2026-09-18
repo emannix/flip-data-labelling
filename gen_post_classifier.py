@@ -41,8 +41,10 @@ for VIC (`--fit-on val`): it needs per-crop scores on `val_df.csv` from the base
 checkpoints, which the training runs did not save. The dataset builder's
 `*_predict_percrop.yaml` config produces exactly that when its `test_csv_file` is
 `val_df.csv` (ungrouped, so the saved index is the csv's row order, which is the
-`sam3_val_df.csv` row order too). Point `--split-runs` at the directory those runs land
-in; `--fit-on auto` (the default) uses them for every base that has them and falls back
+`sam3_val_df.csv` row order too) - the `*_postclassifier_test.yaml` configs in the run
+repository's `overrides/flip_2026_09_04_interpretable_run/` do exactly that for the
+master ComFe and the linear probe. Point `--split-runs` at the directory those runs land
+in (default `view/flip_2026_09_04_postclassifier_test/`); `--fit-on auto` (the default) uses them for every base that has them and falls back
 to cross-validation for the rest. `--fit-on both` reports both fits side by side.
 
 Classes with fewer than `--min-positives` positives in the fitting data cannot be fitted
@@ -98,7 +100,7 @@ MODELS_CSV = EVAL / "models.csv"
 # (checkpoint x split), each carrying its `.hydra/config.yaml` and `predictions/`. The
 # base a run belongs to is read off its name with the evaluation script's `match`
 # substrings, the split off its config's `test_csv_file`.
-SPLIT_RUNS = ev.VIEW / "flip_2026_09_04_percrop"
+SPLIT_RUNS = ev.VIEW / "flip_2026_09_04_postclassifier_test"
 MATCH = {m["key"]: m["match"] for m in ev.MODELS if m["match"]}
 # A cascade has no checkpoints of its own; its val scores would have to be built from
 # its parents', which is not done here, so it can only be fitted by cross-validation.
@@ -218,6 +220,55 @@ def run_split(run_dir: Path) -> str | None:
     return found[-1] if found else None
 
 
+def run_checkpoint_seed(run_dir: Path) -> str | None:
+    """The seed label of the training run a test job loaded, off its `ckpt_path`.
+
+    Written the way `ev.run_seed` labels the training runs (`1-5/3`), so a val-split
+    run can be paired with the test-split scores of the same checkpoint by name.
+    """
+    config = run_dir / ".hydra" / "config.yaml"
+    text = config.read_text() if config.exists() else ""
+    found = re.search(r"_(\d+-\d+)_(\d+)/checkpoints/", text)
+    return f"{found.group(1)}/{found.group(2)}" if found else None
+
+
+def load_percrop_run(run_dir: Path, frame: pd.DataFrame, classes: list[str]) -> np.ndarray:
+    """One ungrouped run's scores in `frame`'s row order.
+
+    The saved index is normally the row position. If a run saved group ids instead,
+    unique ids are mapped through the frame's `group_id`; ids that repeat (a farm-level
+    split has several crops per group) are accepted only when they read back exactly
+    as the frame's `group_id` column, which is what a sequential loader produces.
+    """
+    path = ev.predictions_dir(run_dir)
+    y_hat = pd.read_csv(next(path.glob("*_y_hat_predictions*.csv"))).to_numpy(dtype=float)
+    saved = pd.read_csv(next(path.glob("*_index_predictions*.csv")))["index"]
+    n = len(frame)
+    if y_hat.shape != (n, len(classes)):
+        raise SystemExit(f"{run_dir.name}: y_hat is {y_hat.shape}, expected {(n, len(classes))}")
+    if pd.api.types.is_integer_dtype(saved):
+        index = saved.to_numpy()
+    else:
+        ids = frame["group_id"].astype(str).to_numpy()
+        saved = saved.astype(str).to_numpy()
+        if len(set(ids)) == n:
+            lookup = pd.Series(np.arange(n), index=ids)
+            index = lookup.reindex(saved).to_numpy()
+            if np.isnan(index).any():
+                raise SystemExit(f"{run_dir.name}: saved index has ids not in the split")
+            index = index.astype(int)
+        elif (saved == ids).all():
+            index = np.arange(n)
+        else:
+            raise SystemExit(f"{run_dir.name}: saved index is neither row positions nor the "
+                             f"split's group_id column in row order")
+    if not np.array_equal(np.sort(index), np.arange(n)):
+        raise SystemExit(f"{run_dir.name}: index is not a permutation of {n} rows")
+    ordered = np.empty_like(y_hat)
+    ordered[index] = y_hat
+    return ordered
+
+
 def run_grouped(run_dir: Path) -> bool:
     """True if the run pooled its scores over groups, which per-crop fitting cannot use."""
     config = run_dir / ".hydra" / "config.yaml"
@@ -247,8 +298,8 @@ def load_split_scores(
         classes = ev.config_classes(run_dir)
         if classes and classes != base["classes"]:
             raise SystemExit(f"{run_dir.name}: class order {classes} != {base['classes']}")
-        seeds.append(ev.load_run(run_dir, len(frame), base["classes"], frame["group_id"].to_numpy()))
-        labels.append(ev.run_seed(run_dir))
+        seeds.append(load_percrop_run(run_dir, frame, base["classes"]))
+        labels.append(run_checkpoint_seed(run_dir) or ev.run_seed(run_dir))
     if not seeds:
         return None
     return {"seeds": seeds, "seed_labels": labels, "ensemble": sum(seeds) / len(seeds)}
@@ -441,14 +492,19 @@ def post_model_val(
 
     prefix, what, measure = STACKERS[kind]
     ensemble = fit_one(val_scores["ensemble"], base["ensemble"])
-    paired = len(val_scores["seeds"]) == len(base["seeds"])
-    seeds = (
-        [fit_one(v, t) for v, t in zip(val_scores["seeds"], base["seeds"])] if paired else [ensemble]
-    )
-    labels = (
-        [f"{v}x{t}" for v, t in zip(val_scores["seed_labels"], base["seed_labels"])]
-        if paired else ["ensemble"]
-    )
+    # A seed of the stacker is one checkpoint's val scores fitted and applied to that
+    # same checkpoint's test scores: paired by checkpoint label where the labels agree,
+    # by position when they do not but the counts do, else the ensemble alone.
+    by_label = dict(zip(val_scores["seed_labels"], val_scores["seeds"]))
+    if all(label in by_label for label in base["seed_labels"]):
+        pairs = [(by_label[label], t, label) for label, t in zip(base["seed_labels"], base["seeds"])]
+    elif len(val_scores["seeds"]) == len(base["seeds"]):
+        pairs = [(v, t, f"{lv}x{lt}") for v, t, lv, lt in zip(
+            val_scores["seeds"], base["seeds"], val_scores["seed_labels"], base["seed_labels"])]
+    else:
+        pairs = []
+    seeds = [fit_one(v, t) for v, t, _ in pairs] or [ensemble]
+    labels = [label for _, _, label in pairs] or ["ensemble"]
     model = derived(
         base,
         f"{prefix}_{base['key']}",
