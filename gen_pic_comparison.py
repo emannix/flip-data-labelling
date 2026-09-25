@@ -37,6 +37,12 @@ runs a species when the register counts more than `--min-stock` (default 5) of i
 species is judged on its own, so one farm can run several; a coarse class (`cattle`,
 `livestock`) is present when any of its species is. A farm with no value runs nothing.
 
+*Models.* Farm scores come from the post-classifier's `scores_farm.csv`, plus the
+2026-09-18 ComFe and ViT-L linear probe trained on the SAM3 relabel
+(`view/flip_comfe_2026_09_18/`), which have no post-classifier pass and are read from
+their seed runs here: seed-mean per crop, max over the farm's crops, as for the others.
+Their test csv holds the same 1,146 crops, so they are scored on the same farms and truth.
+
 *Classes.* Farm truth is the evaluation's `true|<class>`, parsed from the workbooks'
 farm sheet. The register has no pig grade, so the three pig classes are compared as one
 `pig`, and the models' pig score is the max over the three. `cattle` (beef or dairy) and
@@ -87,15 +93,40 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score
 
+import gen_evaluation_2026_09_04 as ev
+
 BUILDER = Path("/home/mannixe/FLIP/flip-geoimage-dataset-builder")
 BUILDS = [BUILDER / "original_new_2026_08_21_generalisation"]
 SCORES = Path("output_post_classifier_2026_09_04/scores_farm.csv")
 OUTPUT = Path("output_pic_comparison_2026_09_25")
 
+# Runs scored here directly rather than through gen_post_classifier.py: the 2026-09-18
+# pair, trained on the SAM3 relabel of original_master_2026_09_18. Their test csv is the
+# same 1,146 crops on the same 242 farms as the 2026-09-04 one, so their farm scores are
+# built the same way (seed-mean per crop, max over the farm's crops) and join on
+# farm_uid against the same truth.
+RUN_TEST_CSV = Path("original_master_2026_09_18/sam3_test_autocrop_gen_vic.csv")
+RUNS = ev.VIEW / "flip_comfe_2026_09_18"
+EXTRA_MODELS = [
+    {
+        "key": "comfe_s3",
+        "label": "ComFe multilabel (2026-09-18, SAM3 relabel)",
+        "detail": "DINOv2 ViT-L/14 w/ reg., trained on the SAM3 relabel of the 2026-09-18 master build",
+        "match": "comfe_dinov2",
+    },
+    {
+        "key": "lin_s3",
+        "label": "DINOv2 ViT-L linear probe (2026-09-18, SAM3 relabel)",
+        "detail": "DINOv2 ViT-L/14 w/ reg., trained on the SAM3 relabel of the 2026-09-18 master build",
+        "match": "linear_finetune",
+    },
+]
+
 # Only models never fitted on VIC labels are a fair comparison: the ComFe master and its
-# fixed-rule SAM3 gate. postcv_comfe_m, the SAM3 logistic stacker, is cross-validated on
-# this very hold-out and is carried as a reference, not a contender.
-DEFAULT_MODELS = ["comfe_m", "gate_comfe_m", "postcv_comfe_m"]
+# fixed-rule SAM3 gate, and the 2026-09-18 SAM3-relabel pair. postcv_comfe_m, the SAM3
+# logistic stacker, is cross-validated on this very hold-out and is carried as a
+# reference, not a contender.
+DEFAULT_MODELS = ["comfe_m", "gate_comfe_m", "comfe_s3", "lin_s3", "postcv_comfe_m"]
 
 # The farm-level survey value's top-level key in the farm json, per register species.
 TOP_LEVEL = {
@@ -189,6 +220,34 @@ def read_pic(builds: list[Path], farms: set[str]) -> pd.DataFrame:
     if missing:
         raise SystemExit(f"{len(missing)} scored farms have no metadata json, e.g. {sorted(missing)[:3]}")
     return pic
+
+
+def run_scores(farms: pd.Series, test_csv: Path, runs: Path, wanted: list[str]) -> tuple[pd.DataFrame, dict]:
+    """Farm scores for the EXTRA_MODELS in `wanted`, read straight off their seed runs.
+
+    Returns `<key>|<class>` columns in `farms` order and each key's display name. A family
+    with no finished seed is left out with a note, as the evaluation scripts do.
+    """
+    test = pd.read_csv(test_csv, low_memory=False)
+    missing = set(farms) - set(test["farm_uid"])
+    if missing:
+        raise SystemExit(f"{len(missing)} scored farms are not in {test_csv}, e.g. {sorted(missing)[:3]}")
+    columns, names = {"farm_uid": farms.to_numpy()}, {}
+    for spec in EXTRA_MODELS:
+        if spec["key"] not in wanted:
+            continue
+        model = ev.load_model(
+            {**spec, "runs": runs, "classes": ev.MASTER_CLASSES, "space": "test"},
+            None, 0, len(test), test["group_id"].to_numpy(),
+        )
+        if model["ensemble"] is None:
+            print(f"{spec['key']}: no finished run under {runs} matching {spec['match']!r}, skipped")
+            continue
+        farm = ev.farm_scores(model["ensemble"], test["farm_uid"].to_numpy(), farms.to_numpy(), "max")
+        for i, name in enumerate(ev.MASTER_CLASSES):
+            columns[f"{spec['key']}|{name}"] = farm[:, i]
+        names[spec["key"]] = f"{spec['label']}, {len(model['seeds'])} seeds"
+    return pd.DataFrame(columns), names
 
 
 def register_counts(pic: pd.DataFrame, reading: str, name: str) -> np.ndarray:
@@ -472,10 +531,16 @@ def main() -> None:
                         help="the register calls a species present above this head count")
     parser.add_argument("--bootstrap", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--runs", type=Path, default=RUNS,
+                        help="seed runs of the EXTRA_MODELS keys, scored here directly")
+    parser.add_argument("--run-test-csv", type=Path, default=RUN_TEST_CSV,
+                        help="the test csv those runs predicted on, in its row order")
     parser.add_argument("--output", type=Path, default=OUTPUT)
     args = parser.parse_args()
 
     scores = pd.read_csv(args.scores, low_memory=False)
+    extra, extra_names = run_scores(scores["farm_uid"], args.run_test_csv, args.runs, args.models)
+    scores = scores.merge(extra, on="farm_uid", how="left", validate="one_to_one")
     pic = read_pic(args.builds, set(scores["farm_uid"]))
     pic = pic.set_index("farm_uid").loc[scores["farm_uid"]].reset_index()
 
@@ -491,7 +556,7 @@ def main() -> None:
     crosstab(scores, pic, args.min_stock).to_csv(args.output / "crosstab.csv", index=False)
     disagreements(scores, pic, args.models[0], args.min_stock).to_csv(args.output / "disagreements.csv", index=False)
     (args.output / "comparison.html").write_text(
-        html_report(table, pairs, args.models, model_names(args.scores), len(scores),
+        html_report(table, pairs, args.models, {**model_names(args.scores), **extra_names}, len(scores),
                     int(pic["pic_has_value"].sum()), args)
     )
 
