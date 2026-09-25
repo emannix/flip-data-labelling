@@ -975,17 +975,37 @@ def unmatched_inventory(df, args):
     ).reset_index(drop=True)
 
 
-def copy_imagery(df, output_dir, mode, extra, workers=8):
+def farm_metadata(args):
+    """Every farm's metadata JSON under the four crop builds, as {output path: source}.
+
+    The builder writes one `farm-<uid>/farm-<uid>_metadata.json` per farm it cuts: the
+    source record the farm came from (register or PIC fields, the polygon, `Farm_type`),
+    the register re-join (`farm_meta`), any `duplicate_entries`, and the aerial captures
+    it intersects — the record of how each farm's rows came to be. They are copied beside
+    the crops at the same relative
+    path, for every farm the build knows about, whether or not any of its crops reached a
+    split. `historical` has none.
+    """
+    jobs = {}
+    for name in RELABELLED + ["autocrops"]:
+        root = Path(getattr(args, name))
+        for path in root.glob("*/*_metadata.json"):
+            jobs[f"{SUBDIR[name]}/{path.relative_to(root)}"] = path
+    return jobs
+
+
+def copy_imagery(df, output_dir, mode, extra, metadata, workers=8):
     """Put every row's imagery under output_dir at the path image_path already names.
 
     Each source keeps its own subfolder, so the two that share source photographs each get
     their own copy and neither subfolder depends on the other. `extra` carries the images
     no split points at: they are copied too, so the directory holds every valid picture
     the three builds produced, and unmatched_to_labels.csv says why each is unlabelled.
+    `metadata` is the farm JSONs from farm_metadata, copied alongside.
     """
     if mode == "none":
         return 0, []
-    jobs = {}
+    jobs = dict(metadata)
     for row in df.itertuples():
         root = Path(row.source_dataset_path)
         jobs[row.image_path] = root / row.source_relpath
@@ -1011,7 +1031,8 @@ def copy_imagery(df, output_dir, mode, extra, workers=8):
         return ""
 
     total = len(jobs)
-    print(f"{mode}ing {total} image files into {output_dir}/ ...", flush=True)
+    print(f"{mode}ing {total} files ({len(metadata)} farm metadata JSONs) into "
+          f"{output_dir}/ ...", flush=True)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for done, result in enumerate(pool.map(one, jobs.items()), 1):
             if result:
@@ -1036,7 +1057,7 @@ def class_table(df, index):
     return pd.crosstab(exploded["cls"], exploded[index]).to_string()
 
 
-def readme(df, totals, args, missing, unmatched):
+def readme(df, totals, args, missing, unmatched, metadata):
     """The provenance document, written from this run's own numbers."""
     counts = {name: int((df["split"] == name).sum()) for name in SPLIT_FILES}
     groups = df.groupby("split")["group_id"].nunique()
@@ -1373,6 +1394,29 @@ def readme(df, totals, args, missing, unmatched):
         f"gets its own copy so no subfolder depends on another. Mode for this build: "
         f"`{args.imagery}`.",
         "",
+        "## farm metadata",
+        "",
+        f"{len(metadata):,} farm metadata JSONs sit beside the crops, at "
+        "`<source>/farm-<uid>/farm-<uid>_metadata.json` — one per farm the builder cut, "
+        "whether or not any of its crops reached a split:",
+        "",
+        "```",
+    ]
+    by_source = collections.Counter(path.split("/")[0] for path in metadata)
+    for name in SOURCE_ORDER:
+        if SUBDIR[name] in by_source:
+            lines.append(f"  {name:<28} {by_source[SUBDIR[name]]:>6,} farms")
+    lines += [
+        "```",
+        "",
+        "Each is the builder's record of how that farm came to be cut: the source "
+        "register or PIC row it was read from, the farm polygon, the `Farm_type` label "
+        "(the farm-level label `autocrops` applies to every crop), `farm_meta` (the "
+        "property re-joined against the livestock register), `duplicate_entries` (further "
+        "source entries matched to the same farm), and the aerial captures it intersects. "
+        "Join a row to its farm through `farm_uid`. `historical` has no farm identity "
+        "and so no metadata.",
+        "",
         "## rows per split x class",
         "",
         "A multi-label row counts under each of its classes.",
@@ -1466,15 +1510,16 @@ def main():
         print(f"  {reason:<20}{len(part):>7,}  ({kept:,} copied, "
               f"{part['file_bytes'].sum() / 2**30:.1f} GB)")
 
-    copied, missing = copy_imagery(df, args.output_dir, args.imagery, unmatched)
+    metadata = farm_metadata(args)
+    copied, missing = copy_imagery(df, args.output_dir, args.imagery, unmatched, metadata)
     if args.imagery != "none":
         verb = {"copy": "copied", "symlink": "symlinked"}[args.imagery]
-        print(f"\n{copied:,} image files {verb}")
+        print(f"\n{copied:,} files {verb}")
         if missing:
             print(f"  warning: {len(missing)} files not found, e.g. {missing[:3]}")
 
     (args.output_dir / "README.md").write_text(
-        readme(df, totals, args, missing, unmatched))
+        readme(df, totals, args, missing, unmatched, metadata))
     print(f"\nwrote {args.output_dir}/README.md")
     return 0
 
