@@ -688,8 +688,12 @@ poultry, 18 commercialpig, 12 sheep), and `train_minus_gen_nsw_df.csv` /
 `val_minus_gen_nsw_df.csv` are train/val without them and without the 103 `autocrops` rows
 on their farms, which go to `train_minus_gen_nsw_overlap.csv` / `val_minus_gen_nsw_overlap.csv`
 under the same test-wins rule as the master build. `region` / `source` say which reach a
-test row is from, so VIC and NSW can be scored apart. `gen_nsw_README.md` has the counts.
-Nothing else is rewritten.
+test row is from, so VIC and NSW can be scored apart. `train_no_autocrops_df.csv` /
+`val_no_autocrops_df.csv` go one step further and drop `autocrops` too, leaving the
+original pipeline's whole-farm photographs alone, so three training sets can be read on
+the one test set: original data, original + farm-labelled crops, and the master's own
+train/val with the relabels in. `gen_nsw_README.md` has the counts. Nothing else is
+rewritten.
 
     .venv/bin/python gen_dataset_master_gen_nsw_test.py
     .venv/bin/python gen_dataset_master_html.py --dataset original_master_2026_09_18/dataset_gen_nsw.csv

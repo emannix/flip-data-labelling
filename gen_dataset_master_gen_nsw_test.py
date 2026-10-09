@@ -15,6 +15,8 @@ can be pointed at either:
     val_minus_gen_nsw_df.csv           val_df, likewise
     train_minus_gen_nsw_overlap.csv    the train rows pulled by the test-wins rule, with the reason
     val_minus_gen_nsw_overlap.csv      the val rows pulled
+    train_no_autocrops_df.csv          train_minus_gen_nsw with autocrops removed as well: historical only
+    val_no_autocrops_df.csv            val_minus_gen_nsw, likewise
     dataset_gen_nsw.csv                every row of dataset.csv under the new split names, for
                                        gen_dataset_master_html.py (--dataset it for gen_nsw_summary.html)
     gen_nsw_README.md                  counts, the class table per split, what moved and why
@@ -23,6 +25,14 @@ Everything else - `test_autocrops`, `test_original`, `test_gen_original` and its
 `train_overlap`, `val_overlap`, `dataset.csv` - is untouched, and the originals are never
 rewritten. Rerun `gen_sam3_postprocess_relabel.py --master <dir>` afterwards and the new
 csvs get their `sam3_` twins like every other csv in the directory.
+
+*The no-autocrops pair* is for a three-step comparison on the one test set: the original
+pipeline's whole-farm photographs alone (`historical`, these two files), those plus the
+farm-labelled building crops (`autocrops`, the `_minus_gen_nsw` pair), and the master's own
+train/val with the relabelled crops in. They are a subset of `train_minus_gen_nsw` /
+`val_minus_gen_nsw`, not a further split, so they need no overlap file of their own and do
+not appear in `dataset_gen_nsw.csv` or the html summary. `historical` has no SAM3 row, so
+their `sam3_` twins carry the columns empty and change no label.
 
 *Test wins, again.* The master build's rule applies to the new test set exactly as it did
 to the old four: any train/val row whose `farm_uid` or source-image stem is in the test set
@@ -45,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import re
 from datetime import date
 from pathlib import Path
 
@@ -69,6 +80,11 @@ RENAMED = {"train": "train_minus_gen_nsw", "val": "val_minus_gen_nsw"}
 OVERLAP_OF = {"train_minus_gen_nsw": "train_minus_gen_nsw_overlap", "val_minus_gen_nsw": "val_minus_gen_nsw_overlap"}
 README = "gen_nsw_README.md"
 DATASET = "dataset_gen_nsw.csv"
+# Subsets of a split written as files of their own: output csv -> (split, source datasets kept).
+DERIVED = {
+    "train_no_autocrops_df.csv": ("train_minus_gen_nsw", ["historical"]),
+    "val_no_autocrops_df.csv": ("val_minus_gen_nsw", ["historical"]),
+}
 
 
 def count(df: pd.DataFrame, unit: str) -> int:
@@ -223,6 +239,22 @@ def formed_table(df: pd.DataFrame) -> list[str]:
     ]
 
 
+def reach_name(source: str) -> str:
+    """`Bega_labels2.shp` -> `Bega`; `Lot_Bega_clean_clip.shp` -> `Bega parcels`."""
+    name = re.sub(r"_labels\d*\.shp$", "", source)
+    parcels = re.fullmatch(r"Lot_(.+)_clean_clip\.shp", source)
+    if parcels:
+        name = parcels.group(1) + " parcels"
+    return name.lower().replace("_", " ")
+
+
+def derived_parts(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    return {
+        name: df[(df["split"] == split) & df["source_dataset"].isin(keep)]
+        for name, (split, keep) in DERIVED.items()
+    }
+
+
 def readme(df: pd.DataFrame, master: Path) -> str:
     moved = df[df["moved"]]
     pulled = df[df["split"].isin(OVERLAP_OF.values())]
@@ -336,10 +368,38 @@ def readme(df: pd.DataFrame, master: Path) -> str:
         class_table(table, "split"),
         "```",
         "",
+        "## the no-autocrops pair",
+        "",
+        "`train_no_autocrops_df.csv` and `val_no_autocrops_df.csv` are `train_minus_gen_nsw` / "
+        "`val_minus_gen_nsw` with `autocrops` removed as well, leaving the original pipeline's "
+        "whole-farm photographs (`historical`) alone. With the `_minus_gen_nsw` pair and the "
+        "master's own `train_df.csv` / `val_df.csv` that makes three training sets on one test "
+        "set: original data; original + the farm-labelled building crops; and those + the "
+        "crop-labelled NSW relabels. They are subsets, not splits, so they have no overlap file "
+        "and are not in `dataset_gen_nsw.csv`; `historical` carries no SAM3 row, so their "
+        "`sam3_` twins change no label.",
+        "",
+        "```",
+        f"  {'file':<36}{'images':>8}{'groups':>9}{'farms':>8}",
+        "\n".join(
+            f"  {name:<36}{count(part, 'images'):>8,}{count(part, 'groups'):>9,}"
+            f"{count(part, 'farms'):>8,}"
+            for name, part in derived_parts(df).items()
+        ),
+        "```",
+        "",
+        "```",
+        class_table(
+            pd.concat([part.assign(file=name) for name, part in derived_parts(df).items()])
+            .assign(n_classes=lambda d: d["n_classes"].astype(int)),
+            "file",
+        ),
+        "```",
+        "",
         f"## `{NEW_TEST}` by reach x class",
         "",
         "```",
-        class_table(table[table["split"] == NEW_TEST].assign(source=lambda d: d["source"].str.replace("_labels.*", "", regex=True)), "source"),
+        class_table(table[table["split"] == NEW_TEST].assign(source=lambda d: d["source"].map(reach_name)), "source"),
         "```",
         "",
         "## columns",
@@ -373,6 +433,10 @@ def main() -> int:
         part = df[df["split"] == name].drop(columns=[])
         part.to_csv(args.master / filename, index=False)
         print(f"  {filename:<34}{len(part):>8,}{part['group_id'].nunique():>9,}")
+
+    for name, part in derived_parts(df).items():
+        part.to_csv(args.master / name, index=False)
+        print(f"  {name:<34}{len(part):>8,}{part['group_id'].nunique():>9,}   (subset of {DERIVED[name][0]})")
 
     table = df[df["split"].isin(FILES)].copy()
     table["n_classes"] = table["n_classes"].astype(int)
