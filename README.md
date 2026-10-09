@@ -630,10 +630,31 @@ step:
   whose log has been quiet for a day are reported as dead rather than pending. Writes
   `output_eval_2026_09_04_backbones/`.
 
+- `gen_evaluation_2026_09_18.py` — the runs on `original_master_2026_09_18/`, ComFe v1
+  against the linear probe with the head, the data recipe and the backbone each read with
+  the other two held fixed. Eleven families: the 2026-09-04 ViT-L/14 +reg pair re-read
+  (`lin_l`, `comfe_l`); the same pair on the grouped 09_18 master (`lin_m18`, `comfe_m18`,
+  `view/flip_comfe_2026_09_18/master_grouped/`) and on its SAM3 relabel with per-image
+  labels (`lin_s3`, `comfe_s3`, the top level of that view); and the comfev2 wave 7b / 7d
+  `v1`, `v1_0904` and `linear` arms on DINOv2 ViT-B/14 without and with registers
+  (`lin_b`, `comfe_b`, `comfe_b04`, `lin_breg`, `comfe_breg`, under `wave7b/` and
+  `wave7d/`). The three 09_18 test csvs are checked against the 2026-09-04 one on the key
+  and every label column, so every model is scored on identical rows and the well-sampled
+  macro is comparable with the three earlier pages. Adds a named-contrasts card (head /
+  data / backbone pairs off the paired macro), a training-count table for the three builds
+  (`training_counts.csv`) and `seed_macro.csv`, the mean of per-seed macro AP, which is
+  the footing the comfev2 wave 7 results documents quote their FLIP mAP on. The wave 8
+  readout arms sit under `wave8/` in the same view but are not scored here. Writes
+  `output_eval_2026_09_18/`. The bootstrap is not what takes the time (the gallery and
+  curves are), but `--bootstrap 10` builds in about two minutes; intervals at that
+  setting are rough.
+
       .venv/bin/python gen_evaluation_2026_09_04.py
       xdg-open output_eval_2026_09_04/evaluation_dashboard.html
       .venv/bin/python gen_evaluation_2026_09_04_backbones.py
       xdg-open output_eval_2026_09_04_backbones/evaluation_dashboard.html
+      .venv/bin/python gen_evaluation_2026_09_18.py --bootstrap 10
+      xdg-open output_eval_2026_09_18/evaluation_dashboard.html
 
 The 2026-09-04 page adds two things. The per-class table carries a training count per
 multilabel generation (397 relabelled NSW crops against 17,927 master crops, of which
@@ -656,6 +677,35 @@ as recall; a number predicts every class scoring above it. The operating points 
 merged into `cattle` and the three pig classes into `pigs` (`CLASS_GROUPS` in the
 script), writing `confusion_farm_merged.csv` and `operating_points_farm_merged.csv`.
 
+
+## the relabelled sources folded into test
+
+`gen_dataset_master_gen_nsw_test.py` writes a second set of splits beside the originals in
+`original_master_2026_09_18/`, with every crop-labelled row on the test side: the
+`generalisation` and `generalisation_extra` train/val rows (1,500 NSW crops, 49 poultry)
+join `test_autocrop_gen_vic` to make `test_autocrop_gen_vic_nsw.csv` (2,646 crops, 52
+poultry, 18 commercialpig, 12 sheep), and `train_minus_gen_nsw_df.csv` /
+`val_minus_gen_nsw_df.csv` are train/val without them and without the 103 `autocrops` rows
+on their farms, which go to `train_minus_gen_nsw_overlap.csv` / `val_minus_gen_nsw_overlap.csv`
+under the same test-wins rule as the master build. `region` / `source` say which reach a
+test row is from, so VIC and NSW can be scored apart. `gen_nsw_README.md` has the counts.
+Nothing else is rewritten.
+
+    .venv/bin/python gen_dataset_master_gen_nsw_test.py
+    .venv/bin/python gen_dataset_master_html.py --dataset original_master_2026_09_18/dataset_gen_nsw.csv
+    xdg-open original_master_2026_09_18/gen_nsw_summary.html
+    .venv/bin/python gen_sam3_postprocess_relabel.py --master original_master_2026_09_18   # sam3_ twins
+
+The script also writes `dataset_gen_nsw.csv`, every row of `dataset.csv` under the new
+split names, and `gen_dataset_master_html.py` recognises it by those names and renders the
+same summary page over this split set as `gen_nsw_summary.html` (the master's
+`summary.html` is unchanged). `gen_nsw_README.md` is this set's README.
+
+Mind what this does to the training labels: with both relabelled sources out, train and
+val are farm-level only, so **`paddock` and `other_industrial` have no training rows at
+all** in the plain csvs. The SAM3 relabel puts paddock back (`sam3_train_minus_gen_nsw_df.csv`
+gates 7,761 autocrops crops to paddock as before); nothing puts `other_industrial` back, so
+a model trained on these splits cannot score it and the class is test-only.
 
 # adding SAM3 structure detections
 

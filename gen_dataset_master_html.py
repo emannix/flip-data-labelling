@@ -64,6 +64,68 @@ SPLITS = [
 ]
 SPLIT_ORDER = [name for name, _ in SPLITS]
 ROLE_OF = dict(SPLITS)
+TRAINING = ["train", "val"]
+
+# The second split set `gen_dataset_master_gen_nsw_test.py` writes beside the master's:
+# every crop-labelled row on the test side. Its `dataset_gen_nsw.csv` carries the same rows
+# under these split names, and the page configures itself on them when it sees them.
+GEN_NSW_TEST = "test_autocrop_gen_vic_nsw"
+GEN_NSW_SPLITS = [
+    ("train_minus_gen_nsw", "training"),
+    ("val_minus_gen_nsw", "training"),
+    ("train_overlap", "pulled from training"),
+    ("val_overlap", "pulled from training"),
+    ("train_minus_gen_nsw_overlap", "pulled from training, for " + GEN_NSW_TEST),
+    ("val_minus_gen_nsw_overlap", "pulled from training, for " + GEN_NSW_TEST),
+    ("test_autocrops", "test"),
+    (GEN_NSW_TEST, "test"),
+    ("test_gen_original", "test"),
+    ("test_gen_original_overlap", "pulled from test_gen_original"),
+    ("test_original", "test"),
+]
+VARIANTS = {
+    "master": {
+        "splits": SPLITS,
+        "training": ["train", "val"],
+        "crop_test": "test_autocrop_gen_vic",
+        "title": "What is in each split of the master dataset?",
+        "file": "summary.html",
+        "note": "",
+    },
+    "gen_nsw": {
+        "splits": GEN_NSW_SPLITS,
+        "training": ["train_minus_gen_nsw", "val_minus_gen_nsw"],
+        "crop_test": GEN_NSW_TEST,
+        "title": "What is in each split, with the relabelled crops all held out?",
+        "file": "gen_nsw_summary.html",
+        "note": (
+            "This is the <strong>second split set</strong> of the same rows, written by "
+            "<code>gen_dataset_master_gen_nsw_test.py</code>: every <code>generalisation</code> "
+            "and <code>generalisation_extra</code> row that was in train or val joins "
+            "<code>test_autocrop_gen_vic</code> to make <code>test_autocrop_gen_vic_nsw</code>, "
+            "and the <code>autocrops</code> rows on their farms are pulled to "
+            "<code>*_minus_gen_nsw_overlap</code>. Train and val are then farm-level labels "
+            "only, so <code>paddock</code> and <code>other_industrial</code> have no training "
+            "rows here (the SAM3 relabel restores paddock; nothing restores other_industrial). "
+            "The master's own splits are unchanged and summarised in <code>summary.html</code>."
+        ),
+    },
+}
+
+
+def configure(variant: str) -> dict:
+    """Point every split-ordered table at one variant's split list."""
+    global SPLITS, SPLIT_ORDER, ROLE_OF, TRAINING
+    spec = VARIANTS[variant]
+    SPLITS = spec["splits"]
+    SPLIT_ORDER = [name for name, _ in SPLITS]
+    ROLE_OF = dict(SPLITS)
+    TRAINING = spec["training"]
+    return spec
+
+
+def detect_variant(df: pd.DataFrame) -> str:
+    return "gen_nsw" if (df["split"] == GEN_NSW_TEST).any() else "master"
 
 # Categorical slots 1-5 from the reference palette, light value first, in the palette's
 # own slot order (which it documents as passing the adjacent-pair checks in both modes).
@@ -583,7 +645,7 @@ def provenance_cards(df: pd.DataFrame) -> str:
 
 
 def tiles(df: pd.DataFrame) -> str:
-    training = df[df["split"].isin(["train", "val"])]
+    training = df[df["split"].isin(TRAINING)]
     tests = df[df["split"].str.startswith("test_") & ~df["split"].str.endswith("_overlap")]
     pulled = df[df["split"].str.endswith("_overlap")]
     cards = [
@@ -702,6 +764,7 @@ h1 { font-size: 30px; line-height: 1.15; margin: 0; text-wrap: balance; font-wei
 .standfirst { margin: 0; color: var(--ink-2); max-width: 66ch; }
 
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
+.banner { margin: 0 0 18px; padding: 12px 16px; border-left: 4px solid var(--pole-up, #2a78d6); background: var(--surface, #fcfcfb); border-radius: 6px; font-size: 0.95em; line-height: 1.45; }
 .tile {
   background: var(--surface); border: 1px solid var(--rule); border-radius: 6px;
   padding: 16px 18px; display: flex; flex-direction: column; gap: 6px;
@@ -811,17 +874,19 @@ code {
 """
 
 
-def build(dataset: Path) -> str:
+def build(dataset: Path) -> tuple[str, str]:
     df = pd.read_csv(dataset, low_memory=False)
     df["overlap_with"] = df["overlap_with"].fillna("")
     df["farm_uid"] = df["farm_uid"].fillna("")
+    spec = configure(detect_variant(df))
+    variant_note = f'<div class="banner">{spec["note"]}</div>' if spec["note"] else ""
 
     ramp = "".join(f'<i style="background:var(--heat-{step})"></i>' for step in range(7))
     sections = [
         f"""
 <header class="masthead">
   <p class="eyebrow">FLIP &middot; {escape(dataset.parent.name)}</p>
-  <h1>What is in each split of the master dataset?</h1>
+  <h1>{spec["title"]}</h1>
   <p class="standfirst">Three source datasets combined into one training corpus and four
   test sets. The dataset counts three different things &mdash; images, label groups and
   farms &mdash; and they do not move together, so every breakdown below is given by more
@@ -829,6 +894,7 @@ def build(dataset: Path) -> str:
   <a href="{THIS_REPO}">{THIS_REPO_NAME}</a>.</p>
 </header>
 """,
+        variant_note,
         f'<div class="tiles">{tiles(df)}</div>',
         f"""
 <section>
@@ -947,7 +1013,7 @@ def build(dataset: Path) -> str:
   <p class="lede">Splits that share a farm or a source photograph, and the rows whose
   label is a placeholder rather than a class. The <code>*_overlap</code> splits are rows
   pulled out of training for reaching a test set &mdash; they were kept, not deleted.
-  <code>test_gen_original</code> and <code>test_autocrop_gen_vic</code> share imagery by
+  <code>test_gen_original</code> and <code>{spec["crop_test"]}</code> share imagery by
   design and must never have their scores pooled.</p>
   <div class="card">
     <div class="card-head"><h3>Shared farms and source images</h3></div>
@@ -989,20 +1055,25 @@ def build(dataset: Path) -> str:
     return (
         "<title>FLIP master dataset summary</title>"
         f"<style>{STYLE}</style>"
-        f'<div class="page">{"".join(sections)}</div>'
+        f'<div class="page">{"".join(sections)}</div>',
+        spec["file"],
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET,
-                        help=f"the master dataset.csv to summarise (default: {DEFAULT_DATASET})")
+                        help=f"the master dataset.csv to summarise (default: {DEFAULT_DATASET}); "
+                             "a dataset_gen_nsw.csv is recognised by its split names and "
+                             "summarised as that split set")
     parser.add_argument("--file", type=Path, default=None,
-                        help="where to write the html (default: summary.html beside --dataset)")
+                        help="where to write the html (default: summary.html beside --dataset, "
+                             "gen_nsw_summary.html for the gen_nsw split set)")
     args = parser.parse_args()
 
-    destination = args.file or args.dataset.parent / "summary.html"
-    destination.write_text(build(args.dataset), encoding="utf-8")
+    page, default_name = build(args.dataset)
+    destination = args.file or args.dataset.parent / default_name
+    destination.write_text(page, encoding="utf-8")
     print(f"wrote {destination}")
 
 
