@@ -51,6 +51,16 @@ page and its well-sampled macro is directly comparable. On the primary hold-out 
 livestock class clears the sampling bar, so its well-sampled macro is the shared nine; the
 wave's own headline, the three target classes, is reported as a fourth macro.
 
+*The PIC register.* On the VIC hold-out the Victorian PIC register is read as one more
+classifier, exactly as `gen_pic_comparison.py` does for the 2026-09-04 post-classifier: each
+of the 242 farms carries the register records that matched its polygon, a species is present
+above `--min-stock` head, and the register's calls and head counts are scored against the same
+workbook farm labels as the models. The register has no pig grade, so the three pig classes
+are compared as one `pig` (a model's pig score is the max over its pig columns), and `cattle`
+and `livestock` are added as coarser views. Each model of PIC_KEYS is read at the register's
+own budget (its top-k farms, k = the register's positives) beside the register, with the
+paired farm-bootstrap difference; the csvs land in `vic/pic_*.csv`.
+
 The run folders are read from `comfe-run-flip/view/flip_comfe_2026_09_18/` - `wave9/` is a
 copy of `v_interpretable/wave9/` without checkpoints (`rsync -a --exclude checkpoints`), to be
 refreshed when the three relaunched arms land.
@@ -75,6 +85,7 @@ import pandas as pd
 
 import gen_evaluation_2026_09_04 as base
 import gen_evaluation_2026_09_04_backbones as sweep
+import gen_pic_comparison as pic
 from gen_evaluation_2026_09_04 import (
     ALL_CLASSES,
     EXAMPLES_CONFUSED,
@@ -536,6 +547,13 @@ GALLERY_KEYS_VIC = ["comfe_l", "lin_l", "comfe_b04", "f4_b", "w9_v1_0904", "w9_f
 GALLERY_KEYS_NSW = ["w9_v1_0904", "w9_f4", "w9_f3", "w9_d1", "w9_lin", "w9_eval", "w9_nppp"]
 REFERENCE_KEYS_VIC = ["comfe_l", "comfe_b04", "w9_f4"]
 REFERENCE_KEYS_NSW = ["w9_f4", "w9_v1_0904", "w9_lin"]
+# Read against the PIC register on the VIC hold-out: the production ViT-L pair, the SAM3
+# pair, the ViT-B v1 / F4 twins on the master, and the wave 9 arms the galleries show plus
+# the three one-class models. The first key is the headline for the disagreements csv.
+PIC_KEYS = [
+    "w9_f4", "w9_v1_0904", "w9_lin", "w9_bin_poultry", "w9_bin_cpig", "w9_bin_bpig",
+    "comfe_l", "lin_l", "comfe_s3", "lin_s3", "comfe_b04", "f4_b",
+]
 
 # Colours. The eleven 2026-09-18 families keep that page's colours. Each head recipe is a
 # hue family and the gen-NSW twin is its darker member, so a prior family and its wave 9
@@ -1355,6 +1373,126 @@ def holdout_sections(
 """
 
 
+# --------------------------------------------------------------------------------------
+# the PIC register on the VIC hold-out
+# --------------------------------------------------------------------------------------
+
+
+def pic_register(vic: dict, args: argparse.Namespace) -> dict | None:
+    """The register against the VIC farm labels and the farm scores of PIC_KEYS.
+
+    Reuses `gen_pic_comparison.py` end to end on this page's own `scores_farm.csv`, which
+    has the layout that script was written for (region, farm_uid, PFI, farm_labels,
+    `true|<class>` and `<key>|<class>` columns), and writes its outputs beside it with a
+    `pic_` prefix. A key with no scored family is left out.
+    """
+    scores = pd.read_csv(vic["out"] / "scores_farm.csv", low_memory=False)
+    keys = [k for k in PIC_KEYS if any(c.startswith(f"{k}|") for c in scores.columns)]
+    if not keys:
+        return None
+    register = pic.read_pic(pic.BUILDS, set(scores["farm_uid"]))
+    register = register.set_index("farm_uid").loc[scores["farm_uid"]].reset_index()
+    table, pairs = pic.compare(scores, register, keys, args.pic_bootstrap, args.seed, args.min_stock)
+    cross = pic.crosstab(scores, register, args.min_stock)
+    disagree = pic.disagreements(scores, register, keys[0], args.min_stock)
+    keep = ["region", "source", "farm_uid", "PFI", "n_crops", "farm_labels"]
+    keep += [c for c in scores.columns if c.startswith("true|")]
+    keep += [c for c in scores.columns if c.split("|")[0] in keys and "#" not in c]
+    out = vic["out"]
+    scores[keep].merge(register, on="farm_uid").to_csv(out / "pic_farm.csv", index=False)
+    table.to_csv(out / "pic_comparison.csv", index=False)
+    pairs.to_csv(out / "pic_pairs.csv", index=False)
+    cross.to_csv(out / "pic_crosstab.csv", index=False)
+    disagree.to_csv(out / "pic_disagreements.csv", index=False)
+    n_pic = int(register["pic_has_value"].sum())
+    print(f"\nPIC register on {vic['name']}: {len(scores)} farms, {n_pic} with a matched PIC; "
+          f"{len(keys)} models read at the register's budget -> {out}/pic_*.csv")
+    with pd.option_context("display.width", 200, "display.max_columns", 30):
+        view = table[table["operating_point"].isin(["register", "matched"])]
+        print(view.pivot_table(index="class", columns="predictor", values="F1", sort=False).round(2).to_string())
+    return {"table": table, "pairs": pairs, "crosstab": cross, "keys": keys, "n_farms": len(scores), "n_pic": n_pic}
+
+
+def pic_section(result: dict | None, models: list[dict], args: argparse.Namespace) -> str:
+    """One section: the register and each model at its budget, AP and F1 per class, plus the cross-tab."""
+    if result is None:
+        return ""
+    names = {m["key"]: m["label"] for m in models}
+    table, pairs, keys = result["table"], result["pairs"], result["keys"]
+    positives = table.drop_duplicates("class").set_index("class")["positives"]
+    register = table[(table["predictor"] == "pic") & (table["operating_point"] == "register")].set_index("class")
+    matched = pairs[pairs["operating_point"] == "matched"].set_index(["model", "class", "metric"])
+
+    def fmt(v: float) -> str:
+        return "&ndash;" if pd.isna(v) else f"{v:.2f}"
+
+    def interval(lo: float, hi: float) -> str:
+        return "" if pd.isna(lo) else f" [{lo:.2f}, {hi:.2f}]"
+
+    def metric_table(metric: str) -> str:
+        head = "".join(f'<th title="{escape(names.get(k, k))}">{escape(k)}</th>' for k in keys)
+        rows = []
+        for name in pic.HTML_ORDER:
+            if name not in register.index:
+                continue
+            sparse = positives[name] < pic.MIN_HTML_POSITIVES
+            reg = register.loc[name]
+            cells = [
+                f'<th>{escape(pic.HTML_NAMES.get(name, name))}</th><td>{positives[name]}</td>'
+                f'<td title="95% interval{interval(reg[f"{metric}_lo"], reg[f"{metric}_hi"])}">{fmt(reg[metric])}</td>'
+            ]
+            for key in keys:
+                if (key, name, metric) not in matched.index:
+                    cells.append("<td>&ndash;</td>")
+                    continue
+                row = matched.loc[(key, name, metric)]
+                title = f"model minus register {row['difference']:+.2f}{interval(row['lo'], row['hi'])}"
+                value = fmt(row["model_value"])
+                cells.append(f'<td title="{title}">{f"<strong>{value}</strong>" if row["clear_of_zero"] else value}</td>')
+            rows.append(f'<tr{" class=sparse" if sparse else ""}>{"".join(cells)}</tr>')
+        return (
+            f'<div class="scroll"><table class="data"><thead><tr><th>class</th><th>labelled farms</th>'
+            f'<th>register</th>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+        )
+
+    cross_rows = "".join(
+        f"<tr><th>{escape(pic.HTML_NAMES.get(r['class'], r['class']))}</th><td>{r['labelled_and_registered']}</td>"
+        f"<td>{r['labelled_not_registered']}</td><td>{r['labelled_no_pic_value']}</td>"
+        f"<td>{r['registered_not_labelled']}</td><td>{r['neither']}</td></tr>"
+        for _, r in result["crosstab"].iterrows()
+    )
+    return f"""
+<section id="pic">
+  <h2>The PIC register &mdash; the VIC hold-out</h2>
+  <p class="lede">The Victorian PIC register read as one more classifier on the
+  {escape(result["n_farms"])} relabelled VIC farms (Balliang, Wyuna), {escape(result["n_pic"])} of
+  which have at least one matched PIC record. The register calls a species present when its
+  largest head count across the farm&rsquo;s matched PICs is above {escape(args.min_stock)};
+  each species is judged on its own, so a farm can carry several. The register has no pig
+  grade, so the three pig classes are compared as one <em>pig</em> (a model&rsquo;s pig score is
+  the max over its pig columns); <em>cattle</em> is beef or dairy and <em>any livestock</em> any
+  class. Truth is the workbook farm labels, as everywhere on this page. AP ranks farms by head
+  count (register) or score (model). F1 is at the register&rsquo;s budget: the model flags as
+  many farms as the register does, its top-<em>k</em> by score. Hover a cell for its interval, or
+  for the model-minus-register difference with its paired farm-bootstrap interval
+  ({escape(args.pic_bootstrap)} draws); <strong>bold</strong> clears zero. Greyed rows have fewer
+  than {pic.MIN_HTML_POSITIVES} labelled farms. Read the register&rsquo;s low precision on sheep and
+  beef as much as a statement about the labels as about the register: stock that needs no
+  structures is often declared and invisible from the air.</p>
+  <div class="card"><div class="card-head"><h3>Average precision</h3></div>{metric_table("AP")}</div>
+  <div class="card"><div class="card-head"><h3>F1 at the register&rsquo;s budget</h3></div>{metric_table("F1")}</div>
+  <div class="card"><div class="card-head"><h3>Labels against the register</h3></div>
+  <div class="scroll"><table class="data"><thead><tr><th>class</th><th>labelled and registered</th>
+  <th>labelled, not registered</th><th>labelled, no PIC value</th><th>registered, not labelled</th>
+  <th>neither</th></tr></thead><tbody>{cross_rows}</tbody></table></div></div>
+  <p class="table-note">Written to <code>vic/pic_comparison.csv</code>, <code>pic_pairs.csv</code>,
+  <code>pic_crosstab.csv</code>, <code>pic_disagreements.csv</code> (every farm/class where the
+  labels and the register part ways, with <code>{escape(keys[0])}</code>&rsquo;s score and rank)
+  and <code>pic_farm.csv</code> (per-farm register features, truth and scores).</p>
+</section>
+"""
+
+
 def build_page(
     nsw: dict,
     vic: dict,
@@ -1363,6 +1501,7 @@ def build_page(
     args: argparse.Namespace,
     train_sizes: dict[str, int],
     train_by_class: dict[str, dict[str, int]],
+    pic_result: dict | None = None,
 ) -> str:
     holdout_names = {HOLDOUT_NSW: "the gen-NSW hold-out", HOLDOUT_VIC: "the VIC hold-out"}
     n_w9 = sum(m["group"] == "wave9" and m["ensemble"] is not None for m in nsw["models"])
@@ -1471,6 +1610,7 @@ def build_page(
             ref_vic, [MACRO_SAMPLED, MACRO_SHARED], metrics_table, "reach", args.aggregation,
             args.farm_threshold, "vic",
         ),
+        pic_section(pic_result, models, args),
         f"""
 <section id="training">
   <h2>What each build trained on</h2>
@@ -1533,6 +1673,12 @@ def build_page(
     5, commercial pig on 8; their pairwise differences there are unreadable, which is what
     the primary hold-out is for ({target_pos["poultry"]} / 12 / {target_pos["commercialpig"]}).
     Commercial pig is still 18 positives: read it with its interval.</p>
+    <p><strong>The PIC register.</strong> <code>gen_pic_comparison.py</code>&rsquo;s reading of
+    the register, run on this page&rsquo;s own VIC farm scores: each VIC farm&rsquo;s
+    <code>farm-*_metadata.json</code> carries the 2019 register polygons holding or nearest its
+    label polygon, a species is present above {escape(args.min_stock)} head, and the models are
+    read at the register&rsquo;s budget. Only the VIC hold-out: the NSW parcels carry no register
+    records.</p>
     <p><strong>Uncertainty.</strong> Percentile bootstrap over the evaluation units, paired
     across models, {args.bootstrap} resamples. An interval is withheld when fewer than half
     the draws were usable.</p>
@@ -1614,6 +1760,10 @@ def main() -> None:
                         help="which farm galleries to build (the slow part)")
     parser.add_argument("--output", type=Path, default=OUTPUT)
     parser.add_argument("--file", type=Path, default=None, help="where to write the dashboard")
+    parser.add_argument("--pic-bootstrap", type=int, default=1000,
+                        help="farm bootstrap resamples for the PIC register comparison (242 farms, cheap)")
+    parser.add_argument("--min-stock", type=float, default=5,
+                        help="the register calls a species present above this head count")
     args = parser.parse_args()
     if args.farm_threshold != "prevalence":
         try:
@@ -1629,11 +1779,20 @@ def main() -> None:
           + ", ".join(f"{r} {n}" for r, n in test_nsw["region"].value_counts().items()))
 
     if GEN_TEST_CSV.exists():
+        # The builder's relabelled test csv is the live one and grows as VIC workbooks land
+        # (Bacchus Marsh on 2026-10-16), so the frozen hold-out must be inside it with the
+        # same labels rather than equal to it row for row.
         gen_test = pd.read_csv(GEN_TEST_CSV, keep_default_na=False)
-        if not (len(gen_test) == len(test_vic) and all(
-            gen_test[k].astype(str).tolist() == test_vic[k].astype(str).tolist() for k in JOIN_KEY
-        )):
-            raise SystemExit(f"{TEST_CSV} is not {GEN_TEST_CSV} row for row")
+        labels = [c for c in test_vic.columns if c.startswith("binary_") and c in gen_test.columns]
+        columns = JOIN_KEY + labels
+        held = set(map(tuple, test_vic[columns].astype(str).to_numpy()))
+        live = set(map(tuple, gen_test[columns].astype(str).to_numpy()))
+        if held - live:
+            raise SystemExit(f"{len(held - live)} crops of {TEST_CSV} are not in {GEN_TEST_CSV} "
+                             "with the same key and labels")
+        extra = len(gen_test) - len(test_vic)
+        print(f"{GEN_TEST_CSV.name}: every crop of {TEST_CSV.name} is in it with the same labels"
+              + (f"; it carries {extra} more crops relabelled since" if extra else ""))
     other = pd.read_csv(TEST_CSV_18, keep_default_na=False, low_memory=False)
     if not same_rows(test_vic, other):
         raise SystemExit(f"{TEST_CSV_18} is not {TEST_CSV} row for row on the key and labels")
@@ -1690,6 +1849,7 @@ def main() -> None:
 
     console_summary(nsw, CONTRASTS_NSW, [MACRO_TARGET, MACRO_SHARED])
     console_summary(vic, CONTRASTS_VIC, [MACRO_SAMPLED, MACRO_SHARED])
+    pic_result = pic_register(vic, args)
 
     # ---- galleries ----------------------------------------------------------------------
     galleries: dict[str, tuple[str, dict | None]] = {HOLDOUT_NSW: ("", None), HOLDOUT_VIC: ("", None)}
@@ -1741,7 +1901,7 @@ def main() -> None:
     ]).to_csv(args.output / "training_counts.csv", index=False)
 
     page = build_page(nsw, vic, galleries, by_holdout[HOLDOUT_NSW] + [m for m in by_holdout[HOLDOUT_VIC] if m["group"] == "prior"],
-                      args, train_sizes, train_by_class)
+                      args, train_sizes, train_by_class, pic_result)
     target = args.file or args.output / "evaluation_dashboard.html"
     target.write_text(page)
     print(f"\nwrote {target} and the CSVs in {args.output}/{{{HOLDOUT_NSW},{HOLDOUT_VIC}}}/")

@@ -76,6 +76,10 @@ start from), `comparison.csv`, `pairs.csv`, `crosstab.csv`, `disagreements.csv`,
 `comparison.html`: per model, survey against pipeline AP and F1 (at the survey's budget)
 with the paired difference and its interval, one table per model.
 
+`gen_evaluation_2026_10_16.py` imports `read_pic`, `compare`, `crosstab` and `disagreements`
+and runs them on its own VIC `scores_farm.csv`, so the wave 9 arms and the prior families are
+read against the register on that page (`output_eval_2026_10_16/vic/pic_*.csv`).
+
 Usage:
 
     .venv/bin/python gen_pic_comparison.py
