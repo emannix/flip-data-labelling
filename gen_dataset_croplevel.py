@@ -170,6 +170,11 @@ CARRY_COLUMNS = [
     "source", "filename", "Lat", "Long", "source_filenames", "source_image_path",
     "crop_width", "crop_height", "crop_res", "crop_std", "crop_fill_frac",
     "blank_reason",
+    # the VicPICs supplement only: the register PIC the polygon is, the raster each crop
+    # was cut from, and whether that raster is the capture the farm was labelled against
+    # (most farms were cut from two to four captures of the same buildings; wms_match
+    # picks one capture per farm for anyone who wants no repeats)
+    "WMS_NAME", "pic", "wms_match", "training_overlap_frac",
 ]
 JOIN_KEYS = ["farm_uid", "ecw_stem", "building_cluster"]
 

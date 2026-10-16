@@ -421,7 +421,8 @@ EXTRA_COLUMNS = [
     "Farm_type", "PFI", "source", "region", "Lat", "Long", "ecw_stem",
     "building_cluster", "crop_width", "crop_height", "crop_res", "crop_std",
     "crop_fill_frac", "blank_reason", "crop_label", "crop_comments", "farm_labels",
-    "farm_processed_class", "label_workbook", "image_classes", "in_gen_labelled",
+    "farm_processed_class", "label_workbook", "WMS_NAME", "pic", "wms_match",
+    "training_overlap_frac", "image_classes", "in_gen_labelled",
     "in_train_exceptions", "in_test_data", "in_gen_data", "in_hpai_data",
     "in_train_data",
 ]
