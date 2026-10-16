@@ -10,7 +10,10 @@ It is written alongside the build's own dataset.csv, never over it.
 Joining is on (farm_uid, ecw_stem, building_cluster) rather than image_path: the
 workbooks were written against the older PFI-keyed collection, so their image_path
 still reads "<PFI>/buildings/<stem>_farm_<PFI>_building_<n>.tif" while the current
-build is keyed on the farm UID. The triple is stable across both.
+build is keyed on the farm UID. The triple is stable across both. One workbook,
+*_bacchusmarsh_oldPFI.xlsx, predates the "Farm UID" column altogether and carries only
+"Farm PFI"; its rows are keyed through the build's own PFI column, which maps one-to-one
+onto farm_uid in every build this script is run against (asserted, not assumed).
 
 A "Multiple Classes" crop is genuinely multi-label — dairy and horse, poultry and
 freerange pig, two real livestock classes in the one crop — and is resolved from the
@@ -88,6 +91,8 @@ SPLIT_NAME = "relabelled_{split}_df.csv"
 IMAGE_SHEET = "Image labels"
 FARM_SHEET = "Farm labels"
 UID_COLUMN = "Farm UID"
+# The older workbooks' only farm identity; used when a row has no Farm UID.
+PFI_COLUMN = "Farm PFI"
 IMAGE_COLUMN = "image_path"
 LABEL_COLUMN = "Label"
 COMMENTS_COLUMN = "Comments"
@@ -121,6 +126,7 @@ LABEL_RENAMES = {
     "freerange pig": "freerangepig",
     "backyard pig": "backyardpig",
     "backyard pigs": "backyardpig",
+    "horses": "horse",
     "commercial pig": "commercialpig",
     "commercial pigs": "commercialpig",
 }
@@ -204,11 +210,43 @@ def workbooks(directory, pattern=WORKBOOK_PATTERN):
     return [p for p in sorted(directory.glob(pattern)) if not p.name.startswith("~$")]
 
 
-def read_crop_labels(directory, pattern=WORKBOOK_PATTERN):
+def row_farm_uid(row, pfi_to_uid):
+    """The farm UID a workbook row refers to.
+
+    Most workbooks carry it in the "Farm UID" column. The older PFI-keyed ones carry
+    only "Farm PFI", which is translated through the build's own PFI -> farm_uid map;
+    a PFI the build does not know stays as it is, so the row surfaces as unmatched
+    rather than silently vanishing.
+    """
+    uid = row.get(UID_COLUMN)
+    if uid is not None and str(uid).strip():
+        return str(uid).strip()
+    pfi = str(row.get(PFI_COLUMN) or "").strip()
+    return (pfi_to_uid or {}).get(pfi, pfi)
+
+
+def pfi_map(build):
+    """PFI -> farm_uid from a build's dataset.csv, for the workbooks that only know PFIs.
+
+    Only sound while the two identify the same farms, so a PFI that names two farm_uids
+    in the build is an error rather than a guess.
+    """
+    pairs = build[["PFI", "farm_uid"]].dropna().astype(str).drop_duplicates()
+    clashes = pairs.groupby("PFI")["farm_uid"].nunique()
+    clashes = clashes[clashes > 1]
+    if not clashes.empty:
+        raise ValueError(f"{len(clashes)} PFIs name more than one farm_uid in the build, "
+                         f"e.g. {sorted(clashes.index)[:3]}; a PFI-keyed workbook cannot "
+                         "be joined")
+    return dict(zip(pairs["PFI"], pairs["farm_uid"]))
+
+
+def read_crop_labels(directory, pattern=WORKBOOK_PATTERN, pfi_to_uid=None):
     """Every labelled crop across the workbooks, keyed on its crop_key triple.
 
     A crop labelled in two workbooks (a reach relabelled after a first pass) keeps the
     label from the workbook read last, and is counted as a duplicate for the report.
+    pfi_to_uid (see pfi_map) resolves the rows of a workbook that has no Farm UID.
     """
     labels = {}
     duplicates = []
@@ -220,7 +258,7 @@ def read_crop_labels(directory, pattern=WORKBOOK_PATTERN):
             label = row.get(LABEL_COLUMN)
             if label is None or not str(label).strip():
                 continue
-            key = crop_key(row[UID_COLUMN], row[IMAGE_COLUMN])
+            key = crop_key(row_farm_uid(row, pfi_to_uid), row[IMAGE_COLUMN])
             if key in labels:
                 duplicates.append(key)
             labels[key] = {
@@ -231,12 +269,12 @@ def read_crop_labels(directory, pattern=WORKBOOK_PATTERN):
     return labels, duplicates
 
 
-def read_farm_labels(directory, pattern=WORKBOOK_PATTERN):
+def read_farm_labels(directory, pattern=WORKBOOK_PATTERN, pfi_to_uid=None):
     """Per-farm class set from the "Farm labels" sheets, as a comma-separated string.
 
     The farm sheet marks each class the labeller saw anywhere on the farm with an X,
     so a farm can carry several. Kept alongside the crop label so a crop-level row
-    still says what the whole farm is.
+    still says what the whole farm is. pfi_to_uid resolves a sheet with no Farm UID.
     """
     farms = collections.defaultdict(list)
     for path in workbooks(directory, pattern):
@@ -244,7 +282,7 @@ def read_farm_labels(directory, pattern=WORKBOOK_PATTERN):
         if rows is None:
             continue
         for row in rows:
-            uid = str(row.get(UID_COLUMN) or "")
+            uid = row_farm_uid(row, pfi_to_uid)
             if not uid:
                 continue
             marked = [
@@ -369,8 +407,9 @@ def build_dataset(dataset_csv, labelled_dir, nsw_sources, vic_sources,
                   workbook_pattern=WORKBOOK_PATTERN):
     """Join the crop labels onto the builder's rows and assign the splits."""
     source = pd.read_csv(dataset_csv, dtype={"building_cluster": str, "PFI": str})
-    labels, duplicates = read_crop_labels(labelled_dir, workbook_pattern)
-    farm_labels = read_farm_labels(labelled_dir, workbook_pattern)
+    pfi_to_uid = pfi_map(source)
+    labels, duplicates = read_crop_labels(labelled_dir, workbook_pattern, pfi_to_uid)
+    farm_labels = read_farm_labels(labelled_dir, workbook_pattern, pfi_to_uid)
 
     keys = [crop_key(row.farm_uid, row.image_path) for row in source.itertuples()]
     matched = [key in labels for key in keys]

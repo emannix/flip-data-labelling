@@ -1,7 +1,10 @@
 """Fold the NSW crop-labelled case studies into the VIC hold-out: one bigger relabelled test.
 
 `test_autocrop_gen_vic.csv` is the only test set with crop-level labels, and it rests on
-two Victorian reaches: 1,146 crops, three of them poultry, five sheep, eight commercialpig.
+Victorian reaches alone: 1,146 crops on Balliang and Wyuna in the 2026-09-18 build, three
+of them poultry, five sheep, eight commercialpig; 2,342 crops in the 2026-10-16 labels
+build (`labels_2026_10_16/` under it) once Bacchus Marsh and the extra build's Wyuna parcels
+were labelled, still only seven poultry, fifteen sheep and eight commercialpig.
 Every other crop that was relabelled the same way is NSW and sits in train and val: the
 `generalisation` source's five case studies (Bega, Caniaba, Freemans, Mangrove and Nowra;
 397 and 86 crops, 49 of them poultry) and the `generalisation_extra` parcel crops on those
@@ -39,7 +42,8 @@ to the old four: any train/val row whose `farm_uid` or source-image stem is in t
 is pulled out, by whole group, into the overlap csv with the reason. The `generalisation`
 crops were cut on 24 farms that `autocrops` also holds, so the autocrops rows on those
 farms, and the eight `generalisation_extra` shares with it, go to overlap (103 rows in the
-2026-09-18 build); the `historical` whole-farm images of the same photographs already sit
+2026-09-18 build and again in its 2026-10-16 labels build); the `historical` whole-farm
+images of the same photographs already sit
 in `test_gen_original_overlap`, a test-side split, so nothing is pulled by image. With both
 relabelled sources on the test side, train and val carry farm-level labels only.
 

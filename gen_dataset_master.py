@@ -58,8 +58,15 @@ group_id is prefixed with the dataset because (1) and (2) share 24 farm_uids and
 otherwise merge across two independently split sources. The raw farm_uid and ecw_stem stay
 on every row, so regrouping (2) by farm and capture later remains available.
 
-Output goes to original_master_2026_09_04/ — the csvs and README at the top, each source's
-imagery copied into its own subfolder at its original relative path.
+Output goes to original_master_2026_09_18/labels_2026_10_16/ — the csvs and README at the
+top, each source's imagery under its own subfolder at its original relative path.
+
+A dated build directory is frozen once results have been measured on it. When only the
+labels move — a new workbook lands in labelled_sheets/ — the rebuild goes in a
+labels_<date>/ subfolder of the build whose imagery it shares, with the five imagery
+subfolders symlinked to the parent's (`ln -s ../autocrops autocrops` and so on) before this
+script runs, so image_path resolves from either directory and the copy step finds every
+file already in place. The parent's csvs stay exactly as they were.
 """
 
 import argparse
@@ -79,6 +86,7 @@ from gen_dataset_croplevel import (
     DEFAULT_DROP_LABELS,
     crop_key,
     normalise_label,
+    pfi_map,
     read_crop_labels,
 )
 
@@ -100,10 +108,11 @@ DEFAULT_GENERALISATION_EXTRA_TEST = Path(
 DEFAULT_HISTORICAL = Path(
     "/home/mannixe/FLIP/flip-dataset-processing/output/flip_historical"
 )
-# A new directory rather than original_master_2026_09_04/: that build is what the
-# 2026-09-04 evaluation, the SAM3 relabel and the post-classifier were measured on, and
-# it stays as it was.
-DEFAULT_OUTPUT = Path("original_master_2026_09_18")
+# A subfolder rather than original_master_2026_09_18/ itself: that build is what the
+# 2026-09-18 evaluation and the wave 9 runs were measured on, and it stays as it was.
+# labels_2026_10_16 is the same imagery under the labels as of 2026-10-16 — the Bacchus
+# Marsh and extra-build Wyuna workbooks added to the crop-level test side.
+DEFAULT_OUTPUT = Path("original_master_2026_09_18/labels_2026_10_16")
 
 # Each source's imagery is copied into its own subfolder, so the two sources that share
 # source photographs cannot collide and each subfolder stays self-contained.
@@ -281,9 +290,7 @@ SOURCE_NOTES = {
             "**Geographic — a whole-region hold-out.** The point is that the held-out "
             "set is a different landscape, not a different farm in the same one:\n\n"
             "- **train / val — NSW**: Bega, Caniaba, Freemans, Mangrove, Nowra.\n"
-            "- **test — VIC**: Balliang and Wyuna. `gen_dataset_croplevel.py` also names "
-            "Bacchus Marsh and Gisborne as VIC test reaches, but their workbooks are not "
-            "labelled yet, so they contribute no rows.\n\n"
+            "{vic_test}\n\n"
             "Within NSW the train/val cut is farm-grouped and stratified on the farm's "
             "most common non-background crop class, 20% of farms to val, "
             "`random_state=42`.\n\n"
@@ -316,9 +323,7 @@ SOURCE_NOTES = {
             "anything but Ambiguous.\n\n"
             "- **train / val — NSW**: Bega, Caniaba, Corowa, Freemans, Hanwood, "
             "Mangrove, Nowra, Redlands.\n"
-            "- **test — VIC**: Bacchus Marsh, Balliang, Gisborne, Wyuna — cut but **not "
-            "labelled yet**, so this source contributes no test rows. Casino (NSW) is "
-            "likewise cut and unlabelled.\n\n"
+            "{vic_test} Casino (NSW) is likewise cut and unlabelled.\n\n"
             "Within NSW the train/val cut is farm-grouped and stratified on the farm's "
             "most common non-background crop class, 20% of farms to val, "
             "`random_state=42`, drawn independently of `generalisation`'s cut — the two "
@@ -402,7 +407,14 @@ IDENTITY_COLUMNS = [
     "image_path", "source_relpath", "source_image_path", "source_image_relpath",
     "source_image_name", "source_image_stem", "farm_uid",
 ]
-LABEL_COLUMNS = ["processed_class", "crop_classes", "n_classes"]
+LABEL_COLUMNS = ["processed_class", "processed_class_w9", "crop_classes", "n_classes"]
+# processed_class_w9: one class per row for class-index loaders (the reference methods,
+# the linear probe). processed_class, except that a multi-class row keeps a target class
+# when it carries one, in this precedence. It is the `w9_class` rule of the wave 9 overlay
+# (comfe-run-flip tools/flip_w9_csvs.py) written into the build itself, so no separate
+# copy of the csvs is needed; the overlay's other step, dropping rows whose label_status
+# is not `labelled`, is the loader's to apply on that column.
+W9_TARGETS = ["commercialpig", "poultry", "backyardpig"]
 OVERLAP_COLUMNS = ["overlap_with", "overlap_reason"]
 # Carried through where the source has them, blank elsewhere.
 EXTRA_COLUMNS = [
@@ -486,6 +498,12 @@ def normalise(df, dataset, root, source_file, source_split, label_level,
     ]
     out["n_classes"] = positives.sum(axis=1)
     out["processed_class"] = df["processed_class"].fillna("").astype(str)
+    out["processed_class_w9"] = [
+        next((t for t in W9_TARGETS if t in classes), primary) if len(classes) > 1 else primary
+        for classes, primary in zip(
+            (c.split(",") for c in out["crop_classes"]), out["processed_class"]
+        )
+    ]
     # (3)'s gen_all carries 762 rows whose processed_class is a placeholder rather than a
     # class and whose binary_ columns are all False. They are kept, but a loader has to
     # be able to filter them out of training and scoring.
@@ -844,7 +862,8 @@ def generalisation_reasons(root, labelled_dir):
                         low_memory=False)
     labels = {}
     if labelled_dir and Path(labelled_dir).is_dir():
-        labels, _ = read_crop_labels(Path(labelled_dir))
+        # pfi_map: the bacchusmarsh workbook carries PFIs rather than farm UIDs
+        labels, _ = read_crop_labels(Path(labelled_dir), pfi_to_uid=pfi_map(build))
     reasons = {}
     for row in build.itertuples():
         found = labels.get(crop_key(row.farm_uid, row.image_path))
@@ -1057,6 +1076,48 @@ def class_table(df, index):
     return pd.crosstab(exploded["cls"], exploded[index]).to_string()
 
 
+# The VIC reaches gen_dataset_croplevel.py holds out, in display form. Which of them a
+# relabelled source actually covers depends on which workbooks have been filled in, so
+# the README reads it off the rows rather than stating it.
+VIC_REACH_NAMES = {
+    "bacchusmarsh": "Bacchus Marsh", "balliang": "Balliang",
+    "gisborne": "Gisborne", "wyuna": "Wyuna",
+}
+
+
+def vic_test_note(name, group):
+    """The "test — VIC" bullet of a relabelled source's split note, from its test rows.
+
+    `source` is the reach shapefile each crop was cut on ("wyuna_labels.shp",
+    "Lot_Bega_clean_clip.shp"), so the reaches present on the test side are read from
+    it, and the VIC reaches the crop-level script names but no row carries are the
+    ones whose workbook is still unlabelled.
+    """
+    present = set()
+    sources = group.loc[group["split"] == "test_autocrop_gen_vic", "source"]
+    for source in sources.dropna().astype(str).str.lower().unique():
+        reach = source[len("lot_"):] if source.startswith("lot_") else source
+        present.update(key for key in VIC_REACH_NAMES if reach.startswith(key))
+    labelled = [VIC_REACH_NAMES[k] for k in VIC_REACH_NAMES if k in present]
+    missing = [VIC_REACH_NAMES[k] for k in VIC_REACH_NAMES if k not in present]
+    join = lambda names: ", ".join(names[:-1]) + (" and " if len(names) > 1 else "") + names[-1]
+    if not labelled:
+        return (f"- **test — VIC**: {join(missing)} — cut but **not labelled yet**, so "
+                "this source contributes no test rows.")
+    text = f"- **test — VIC**: {join(labelled)}."
+    if missing:
+        plural = len(missing) > 1
+        text += (f" `gen_dataset_croplevel.py` also names {join(missing)} as "
+                 f"{'VIC test reaches' if plural else 'a VIC test reach'}, but "
+                 f"{'their workbooks are' if plural else 'its workbook is'} not labelled "
+                 f"yet, so {'they contribute' if plural else 'it contributes'} no rows.")
+    if name == "generalisation" and "bacchusmarsh" in present:
+        text += (" Bacchus Marsh's workbook (`*_bacchusmarsh_oldPFI.xlsx`) predates the "
+                 "`Farm UID` column and is keyed on the property PFI, which the relabel "
+                 "script maps onto `farm_uid` through the build's own `PFI` column.")
+    return text
+
+
 def readme(df, totals, args, missing, unmatched, metadata):
     """The provenance document, written from this run's own numbers."""
     counts = {name: int((df["split"] == name).sum()) for name in SPLIT_FILES}
@@ -1130,7 +1191,8 @@ def readme(df, totals, args, missing, unmatched, metadata):
             "",
             f"**What a row is.** {note['rows']}",
             "",
-            f"**How it was split, upstream.** {note['split']}",
+            "**How it was split, upstream.** "
+            + note["split"].replace("{vic_test}", vic_test_note(name, group)),
             "",
             "Where its rows landed here:",
             "",
@@ -1333,7 +1395,13 @@ def readme(df, totals, args, missing, unmatched, metadata):
         "- `farm_uid` — every source but `historical`, which has none",
         "",
         "**Labels** — `processed_class` (the primary class), `crop_classes` "
-        "(comma-separated, canonical order), `n_classes`, and the 13 `binary_` columns.",
+        "(comma-separated, canonical order), `n_classes`, and the 13 `binary_` columns. "
+        "`processed_class_w9` is the one-class-per-row label for class-index loaders: "
+        "`processed_class`, except that a multi-class row keeps a target class when it "
+        f"has one ({' > '.join(W9_TARGETS)}). It is the `w9_class` rule of the wave 9 "
+        "overlay csvs (`w9/` under the 2026-09-18 build) carried in the build itself, "
+        "which retires that overlay; its other step, dropping rows whose `label_status` "
+        "is not `labelled`, is the loader's to apply.",
         "",
         "Source-specific columns are carried through under their own names and left blank "
         "where a source did not have them.",

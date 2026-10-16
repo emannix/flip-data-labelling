@@ -39,6 +39,7 @@ what happened, so nothing is lost and a consumer can undo it column by column.
     sam3_building                 sam3_gate_score >= --gate-min-score
     sam3_relabel                  "paddock" where the row was relabelled, else ""
     crop_classes_pre_sam3, processed_class_pre_sam3, n_classes_pre_sam3
+    processed_class_w9_pre_sam3   where the build carries processed_class_w9 (2026-10-16 on)
 
 `gen_post_classifier.py` reads these files back and builds classifiers on the SAM3
 columns. A summary of the join and the relabel is written to
@@ -85,7 +86,8 @@ STATS = ["count", "mean_area_m2", "total_area_m2", "max_score"]
 META = ["width", "height", "res_x_m", "res_y_m", "extract_type", "threshold", "mask_threshold", "model"]
 
 # The label columns the relabel rewrites, and the order the build writes `binary_*` in.
-LABEL_COLUMNS = ["crop_classes", "processed_class", "n_classes"]
+# processed_class_w9 is only in builds from 2026-10-16 on, so it is rewritten where present.
+LABEL_COLUMNS = ["crop_classes", "processed_class", "processed_class_w9", "n_classes"]
 RELABEL_TO = "paddock"
 
 
@@ -199,7 +201,8 @@ def relabel(frame: pd.DataFrame) -> pd.DataFrame:
     """
     frame["sam3_relabel"] = ""
     for name in LABEL_COLUMNS:
-        frame[f"{name}_pre_sam3"] = frame[name]
+        if name in frame.columns:
+            frame[f"{name}_pre_sam3"] = frame[name]
     eligible = (
         (frame["label_level"] == "farm")
         & (frame["sam3_available"].astype(str) == "True")
@@ -220,6 +223,8 @@ def relabel(frame: pd.DataFrame) -> pd.DataFrame:
     frame.loc[eligible, "sam3_relabel"] = RELABEL_TO
     frame.loc[eligible, "crop_classes"] = RELABEL_TO
     frame.loc[eligible, "processed_class"] = RELABEL_TO
+    if "processed_class_w9" in frame.columns:
+        frame.loc[eligible, "processed_class_w9"] = RELABEL_TO
     frame.loc[eligible, "n_classes"] = "1"
     for column in binary:
         frame.loc[eligible, column] = str(column == f"binary_{RELABEL_TO}")
@@ -373,7 +378,8 @@ def main() -> None:
             if args.no_relabel:
                 frame["sam3_relabel"] = ""
                 for name in LABEL_COLUMNS:
-                    frame[f"{name}_pre_sam3"] = frame[name]
+                    if name in frame.columns:
+                        frame[f"{name}_pre_sam3"] = frame[name]
             else:
                 changed = relabel(frame)
                 relabelled = int(changed["relabelled_to_paddock"].sum())
